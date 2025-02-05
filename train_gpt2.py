@@ -154,16 +154,35 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): # apple silicone gpu
     device = "mps"
 print(f"using device: {device}")
-num_return_sequences = 5
-max_length = 30
-model = GPT.from_pretrained('gpt2')
+
+# get a data batch
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+with open('input.txt', 'r') as f:
+    text = f.read()
+text = text[:1000]
+tokens = enc.encode(text)
+B, T = 4, 32
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+model = GPT(GPTConfig())
+# get logits
+logits = model(x)
+print(logits.shape)
+import sys; sys.exit(0)
+
+# model = GPT.from_pretrained('gpt2')
 print("it worked lffgg")
-model.eval()
+
 model.to(device)
 
 # prefix tokens
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
+model.eval()
+num_return_sequences = 5
+max_length = 30
+
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
@@ -192,7 +211,7 @@ while x.size(1) < max_length:
         xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
         # append to the sequence
         x = torch.cat((x, xcol), dim=1)
-        
+
 # print the generated text
 for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
