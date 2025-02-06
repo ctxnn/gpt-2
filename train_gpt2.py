@@ -89,6 +89,9 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # weight sharing between the token embeddings and the final logit layer
+        self.lm_head.weight = self.transformer.wte.weight
+
     def forward(self, idx, targets = None):
             B,T = idx.shape # the input idx is always in the shape of (B,T)
             assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -191,8 +194,7 @@ class DataLoaderLite:
 
 train_loader = DataLoaderLite(B=4, T=32)
 model = GPT(GPTConfig())
-# get logits
-logits, loss = model(x, y)
+# get logits and loss
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 for i in range(50):
     x,y = train_loader.next_batch()
