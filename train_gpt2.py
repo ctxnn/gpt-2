@@ -13,6 +13,7 @@ class CasualSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        setattr(self.c_proj, 'NANOGPT_SCALE_INIT', torch.tensor(1))
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -44,10 +45,12 @@ class CasualSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd,4 * config.n_embd)
-        self.gelu = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4 * config.n_embd,config.n_embd)
+            super().__init__()
+            self.c_fc = nn.Linear(config.n_embd,4 * config.n_embd)
+            self.gelu = nn.GELU(approximate='tanh')
+            self.c_proj = nn.Linear(4 * config.n_embd,config.n_embd)
+            # Use setattr to properly set custom attribute
+            setattr(self.c_proj, 'NANOGPT_SCALE_INIT', torch.tensor(1))
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -91,6 +94,22 @@ class GPT(nn.Module):
 
         # weight sharing between the token embeddings and the final logit layer
         self.lm_head.weight = self.transformer.wte.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    # mirroring the gpt2 initialisation by gpt2
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
 
     def forward(self, idx, targets = None):
             B,T = idx.shape # the input idx is always in the shape of (B,T)
