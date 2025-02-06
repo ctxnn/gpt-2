@@ -102,7 +102,7 @@ class GPT(nn.Module):
             logits = self.lm_head(self.transformer.ln_f(x))
             loss = None
             if targets != None:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             return logits, loss
 
     @classmethod
@@ -173,7 +173,14 @@ y = buf[1:].view(B, T)
 model = GPT(GPTConfig())
 # get logits
 logits, loss = model(x, y)
-print(loss)
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+for i in range(50):
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    print(f"step {i}, loss: {loss.item()}") # trained on google colab cpu the FINAL loss was (step 49, loss: 0.0027615006547421217)
+
 import sys; sys.exit(0)
 
 # model = GPT.from_pretrained('gpt2')
