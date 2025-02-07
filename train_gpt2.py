@@ -211,7 +211,8 @@ class DataLoaderLite:
 
 # -----------------------------------------------------------------------------
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=16, T=1024)
+torch.set_float32_matmul_precision('high') # use tensorfloat32 matmul
 model = GPT(GPTConfig())
 # get logits and loss
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
@@ -222,6 +223,7 @@ for i in range(50):
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
+    torch.cuda.synchronize() # wait for the computation to be done
     optimizer.zero_grad()
     print(f"step {i}, loss: {loss.item()}") # trained on google colab cpu the FINAL loss was (step 49, loss: 0.0027615006547421217)
 
