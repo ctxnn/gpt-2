@@ -218,14 +218,36 @@ torch.set_float32_matmul_precision('high') # use tensorfloat32 matmul
 model = GPT(GPTConfig(vocab_size=50304)) #using a no that is has a lots of powers of 2(just not using an ugly no lol1)
 model = model.to(device)
 model = torch.compile(model)
+
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(step):
+    #1 linear warmup for warmup_iters steps
+    if step < warmup_steps:
+        lr = max_lr * (step+1) / warmup_steps
+    #2 if it> kr_decay_iters, return the min lr
+    if step >  warmup_steps:
+        return min_lr
+    #3 in between use cosine decay down to min_lr
+    decay_ratio =(step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <=1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
+
 # get logits and loss
-optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4,betas=(0.9, 0.95),eps=1e-8)
 for i in range(50):
     x,y = train_loader.next_batch()
     x = x.to(device)
     y = y.to(device)
     with torch.autocast(device_type=device,dtype= torch.bfloat16):
         logits, loss = model(x, y)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(i)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     loss.backward()
     optimizer.step()
     torch.cuda.synchronize() # wait for the computation to be done
