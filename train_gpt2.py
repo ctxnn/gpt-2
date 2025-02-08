@@ -215,7 +215,7 @@ class DataLoaderLite:
 
 train_loader = DataLoaderLite(B=16, T=1024)
 torch.set_float32_matmul_precision('high') # use tensorfloat32 matmul
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) #using a no that is has a lots of powers of 2(just not using an ugly no lol1)
 model = model.to(device)
 model = torch.compile(model)
 # get logits and loss
