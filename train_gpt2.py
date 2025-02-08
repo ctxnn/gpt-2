@@ -214,6 +214,8 @@ class DataLoaderLite:
 train_loader = DataLoaderLite(B=16, T=1024)
 torch.set_float32_matmul_precision('high') # use tensorfloat32 matmul
 model = GPT(GPTConfig())
+model = model.to(device)
+model = torch.compile(model)
 # get logits and loss
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
 for i in range(50):
@@ -232,9 +234,6 @@ import sys; sys.exit(0)
 
 # model = GPT.from_pretrained('gpt2')
 print("it worked lffgg")
-
-model.to(device)
-
 # prefix tokens
 model.eval()
 num_return_sequences = 5
