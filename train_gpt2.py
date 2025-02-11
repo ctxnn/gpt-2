@@ -22,8 +22,6 @@ class CasualSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -179,7 +177,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
-        def configure_optimizers(self, weight_decay, learning_rate, device):
+        def configure_optimizers(self, weight_decay, learning_rate, device_type):
             # start with all of the candidate parameters (that require grad)
             param_dict = {pn: p for pn, p in self.named_parameters()}
             param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
@@ -198,7 +196,7 @@ class GPT(nn.Module):
                         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
             # Create AdamW optimizer and use the fused version if it is available
             fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-            use_fused = fused_available and 'cuda' in device
+            use_fused = fused_available and device_type == 'cuda'
             if master_process:
                         print(f"using fused AdamW: {use_fused}")
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
@@ -246,6 +244,7 @@ device_type = "cuda" if device.startswith("cuda") else "cpu"
 import tiktoken
 def load_tokens(filename):
     npt = np.load(filename)
+    npt = npt.astype(np.int32)
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
 # -----------------------------------------------------------------------------
@@ -356,7 +355,7 @@ def get_lr(step):
     return min_lr + coeff * (max_lr - min_lr)
 
 # using optimizer with weight decay and lr
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device_type)
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -379,7 +378,7 @@ for step in range(max_steps):
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
@@ -415,7 +414,7 @@ for step in range(max_steps):
             mask = mask.to(device)
             # get the logits
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
@@ -447,7 +446,7 @@ for step in range(max_steps):
             while xgen.size(1) < max_length:
                 # forward the model to get the logits
                 with torch.no_grad():
-                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                         logits, loss = model(xgen) # (B, T, vocab_size)
                     # take the logits at the last position
                     logits = logits[:, -1, :] # (B, vocab_size)
@@ -475,7 +474,9 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        if ddp:
+            model.module.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  # only sync on the last step
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
@@ -484,8 +485,6 @@ for step in range(max_steps):
 
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
-        if ddp:
-            model.module.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # only sync on the last step
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
@@ -494,7 +493,8 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-    torch.cuda.synchronize() # wait for the computation to be done
+    if device_type == 'cuda':
+        torch.cuda.synchronize() # wait for the computation to be done
     t1 = time.time()
     dt = t1 - t0 # time difference in seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
