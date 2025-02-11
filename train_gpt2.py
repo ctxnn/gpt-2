@@ -290,7 +290,7 @@ class DataLoaderLite:
 
 # add gradient accumulation steps
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 8 # micro batch size
+B = 16 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -304,7 +304,7 @@ torch.set_float32_matmul_precision('high') # use tensorfloat32 matmul
 
 model = GPT(GPTConfig(vocab_size=50304)) #using a no that is has a lots of powers of 2(just not using an ugly no lol1)
 model = model.to(device)
-model = torch.compile(model)
+# model = torch.compile(model) when commented meaning -> sampling is there, when uncommented there is no sampling in the code
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
@@ -334,7 +334,7 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 for step in range(max_steps):
     t0 = time.time()
 
-    # once in a while evaluate our validation loss
+    # once in a while evaluate our validation loss, there is no change in that
     if step % 100 == 0:
         model.eval()
         val_loader.reset()
@@ -352,7 +352,42 @@ for step in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum:.4f}")
-
+            # once in a while generate from the model (except step 0, which is noise)
+            # disabled because torch.compile throws a scary error i can't solve rn
+            # if you disable torch.compile, this code works fine
+            if step > 0 and step % 100 == 0 and False:
+                model.eval()
+                num_return_sequences = 4
+                max_length = 32
+                tokens = enc.encode("Hello, I'm a language model,")
+                tokens = torch.tensor(tokens, dtype=torch.long)
+                tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+                xgen = tokens.to(device)
+                sample_rng = torch.Generator(device=device)
+                sample_rng.manual_seed(42 + ddp_rank)
+                while xgen.size(1) < max_length:
+                    # forward the model to get the logits
+                    with torch.no_grad():
+                        logits, loss = model(xgen) # (B, T, vocab_size)
+                        # take the logits at the last position
+                        logits = logits[:, -1, :] # (B, vocab_size)
+                        # get the probabilities
+                        probs = F.softmax(logits, dim=-1)
+                        # do top-k sampling of 50 (huggingface pipeline default)
+                        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                        # select a token from the top-k probabilities
+                        # note: multinomial does not demand the input to sum to 1
+                        ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                        # gather the corresponding indices
+                        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                        # append to the sequence
+                        xgen = torch.cat((xgen, xcol), dim=1)
+                # print the generated text
+                for i in range(num_return_sequences):
+                    tokens = xgen[i, :max_length].tolist()
+                    decoded = enc.decode(tokens)
+                    print(f"rank {ddp_rank} sample {i}: {decoded}")
     # training loop
     model.train()
     optimizer.zero_grad()
@@ -390,46 +425,5 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
-import sys; sys.exit(0)
 
-# model = GPT.from_pretrained('gpt2')
-print("it worked lffgg")
-# prefix tokens
-model.eval()
-num_return_sequences = 5
-max_length = 30
-
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
-x = tokens.to('device')
-
-# generate! right now x is (B, T) where B = 5, T = 8
-# set the seed to 42
-
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-while x.size(1) < max_length:
-    # forward the model to get the logits
-    with torch.no_grad():
-        logits = model(x) # (B, T, vocab_size)
-        # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size)
-        # get the probabilities
-        probs = F.softmax(logits, dim=-1)
-        # do top-k sampling of 50 (huggingface pipeline default)
-        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        # select a token from the top-k probabilities
-        # note: multinomial does not demand the input to sum to 1
-        ix = torch.multinomial(topk_probs, 1) # (B, 1)
-        # gather the corresponding indices
-        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-        # append to the sequence
-        x = torch.cat((x, xcol), dim=1)
-
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+# -----------------------------------------------------------------------------
