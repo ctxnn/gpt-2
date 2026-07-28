@@ -12,6 +12,7 @@ import random
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -58,11 +59,18 @@ REPORT_NAME = "preparation_report.md"
 COMPLETE_NAME = "COMPLETE"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 GIB = 1024**3
-STREAMING_SOURCE_CACHE_GIB = 2.0
+# FineWeb is loaded through the ordinary cached Hugging Face path.  This is a
+# conservative allowance for the compressed source files and their metadata;
+# completed token shards are still removed locally after S3 verification.
+DATASET_CACHE_GIB = 48.0
 DEPENDENCY_INSTALL_HEADROOM_GIB = 3.0
 UPLOAD_HEADROOM_GIB = 0.5
 METADATA_HEADROOM_GIB = 0.1
 SAFETY_MARGIN_GIB = 2.0
+HF_LOAD_ATTEMPTS = 5
+HF_RETRY_BACKOFF_SECONDS = 2.0
+HF_HUB_DOWNLOAD_TIMEOUT_SECONDS = 120
+HF_HUB_ETAG_TIMEOUT_SECONDS = 30
 
 
 def utc_now() -> str:
@@ -133,10 +141,10 @@ class Settings:
 
 @dataclass(frozen=True)
 class DiskBudget:
-    """Conservative peak-disk estimate for streaming, progressive prep.
+    """Conservative peak-disk estimate for cached, progressive preparation.
 
-    Streaming avoids materializing FineWeb locally. The budget accounts for
-    metadata/cache fragments, dependency installation, one uint16 token
+    FineWeb is downloaded through the ordinary Hugging Face cache. The budget
+    accounts for that source cache, dependency installation, one uint16 token
     buffer, one shard during atomic write/upload, one validation download,
     upload overhead, and a safety margin. Verified shards are deleted after
     remote size/SHA verification, so completed shards do not accumulate.
@@ -170,7 +178,7 @@ class DiskFacts:
 def calculate_disk_budget(shard_size: int = DEFAULT_SHARD_SIZE) -> DiskBudget:
     shard_gib = (shard_size * DTYPE.itemsize) / GIB
     required = (
-        STREAMING_SOURCE_CACHE_GIB
+        DATASET_CACHE_GIB
         + DEPENDENCY_INSTALL_HEADROOM_GIB
         + shard_gib
         + shard_gib
@@ -180,7 +188,7 @@ def calculate_disk_budget(shard_size: int = DEFAULT_SHARD_SIZE) -> DiskBudget:
         + SAFETY_MARGIN_GIB
     )
     return DiskBudget(
-        source_cache_gib=STREAMING_SOURCE_CACHE_GIB,
+        source_cache_gib=DATASET_CACHE_GIB,
         dependency_headroom_gib=DEPENDENCY_INSTALL_HEADROOM_GIB,
         active_token_buffer_gib=shard_gib,
         in_progress_shard_gib=shard_gib,
@@ -286,7 +294,7 @@ def require_free_disk(
     )
     if usage.free < budget.required_gib * GIB:
         raise RuntimeError(
-            "insufficient local disk for calculated streaming preparation budget"
+            "insufficient local disk for calculated preparation budget"
         )
     return facts
 
@@ -335,6 +343,121 @@ def atomic_write_npy(path: Path, tokens: np.ndarray) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def configure_huggingface_cache(cache_dir: Path | str) -> Path:
+    """Set deterministic Hugging Face cache and network-timeout locations."""
+
+    cache_root = Path(cache_dir).expanduser()
+    datasets_cache = cache_root / "datasets"
+    hub_cache = cache_root / "hub"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    datasets_cache.mkdir(parents=True, exist_ok=True)
+    hub_cache.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(cache_root)
+    os.environ["HF_DATASETS_CACHE"] = str(datasets_cache)
+    os.environ["HF_HUB_CACHE"] = str(hub_cache)
+    os.environ.setdefault(
+        "HF_HUB_DOWNLOAD_TIMEOUT", str(HF_HUB_DOWNLOAD_TIMEOUT_SECONDS)
+    )
+    os.environ.setdefault(
+        "HF_HUB_ETAG_TIMEOUT", str(HF_HUB_ETAG_TIMEOUT_SECONDS)
+    )
+    return cache_root
+
+
+def _safe_error_detail(error: BaseException) -> str:
+    detail = " ".join(str(error).split())
+    for variable_name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        secret = os.environ.get(variable_name)
+        if secret:
+            detail = detail.replace(secret, "<redacted>")
+    return (detail or type(error).__name__)[:500]
+
+
+def _exception_chain(error: BaseException) -> Iterator[BaseException]:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _is_transient_dataset_error(error: BaseException) -> bool:
+    """Recognize transport/service failures without retrying auth/config errors."""
+
+    permanent_markers = (
+        "401",
+        "403",
+        "unauthorized",
+        "forbidden",
+        "authentication",
+        "invalid token",
+        "unknown configuration",
+        "invalid configuration",
+        "revision",
+        "not found",
+        "does not exist",
+    )
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "temporary failure",
+        "temporarily unavailable",
+        "incomplete read",
+        "incomplete download",
+        "server error",
+        "rate limit",
+        "too many requests",
+        "remote end closed",
+        "protocol error",
+        "chunkedencodingerror",
+        "502",
+        "503",
+        "504",
+    )
+    try:
+        import requests
+        from urllib3 import exceptions as urllib3_exceptions
+
+        transport_types: tuple[type[BaseException], ...] = (
+            TimeoutError,
+            ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            urllib3_exceptions.ProtocolError,
+            urllib3_exceptions.ReadTimeoutError,
+            urllib3_exceptions.MaxRetryError,
+        )
+    except ImportError:
+        transport_types = (TimeoutError, ConnectionError)
+
+    for candidate in _exception_chain(error):
+        message = str(candidate).lower()
+        response = getattr(candidate, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is not None:
+            if int(status) in {408, 425, 429, 500, 502, 503, 504}:
+                return True
+            if int(status) in {401, 403, 404}:
+                return False
+        if any(marker in message for marker in permanent_markers):
+            return False
+        if isinstance(candidate, transport_types):
+            return True
+        if any(marker in message for marker in transient_markers):
+            return True
+        # Datasets can wrap a transport failure in a RuntimeError without
+        # preserving a typed cause. Retry that bounded, otherwise-unknown
+        # wrapper, while the permanent markers above remain non-retryable.
+        if isinstance(candidate, RuntimeError) and not message:
+            return True
+    return False
 
 
 def load_and_validate_shard(
@@ -685,19 +808,56 @@ def tokenized_documents(
         yield pool.imap(tokenize, dataset, chunksize=16)
 
 
-def load_source_dataset() -> Iterable[dict[str, Any]]:
+def load_source_dataset(
+    cache_dir: Path | str | None = None,
+    *,
+    attempts: int = HF_LOAD_ATTEMPTS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Iterable[dict[str, Any]]:
+    """Load FineWeb through the ordinary cached Hugging Face dataset path.
+
+    ``datasets.load_dataset`` materializes the source dataset into the
+    explicit cache, allowing retries to reuse completed downloads instead of
+    repeatedly issuing fragile streaming range requests.
+    """
+
     from datasets import load_dataset
 
-    # A single streaming split yields source documents in dataset order. The
-    # downstream multiprocessing path uses Pool.imap, which preserves input
-    # order while tokenizing, so shard boundaries remain deterministic.
-    return load_dataset(
-        DATASET_ID,
-        name=DEFAULT_DATASET_CONFIG,
-        split="train",
-        streaming=True,
-        cache_dir=os.environ.get("HF_DATASETS_CACHE"),
+    if attempts < 1:
+        raise ValueError("attempts must be at least one")
+    cache_root = Path(
+        cache_dir
+        or os.environ.get("HF_HOME")
+        or Path.cwd() / "hf-cache"
     )
+    configure_huggingface_cache(cache_root)
+    dataset_cache = os.environ["HF_DATASETS_CACHE"]
+    LOGGER.info(
+        "loading FineWeb dataset through cached non-streaming path cache=%s",
+        dataset_cache,
+    )
+    for attempt in range(1, attempts + 1):
+        try:
+            return load_dataset(
+                DATASET_ID,
+                name=DEFAULT_DATASET_CONFIG,
+                split="train",
+                streaming=False,
+                cache_dir=dataset_cache,
+            )
+        except Exception as error:
+            if attempt >= attempts or not _is_transient_dataset_error(error):
+                raise
+            delay = HF_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            LOGGER.warning(
+                "FineWeb dataset load retry=%d/%d delay_seconds=%.1f error=%s",
+                attempt,
+                attempts,
+                delay,
+                _safe_error_detail(error),
+            )
+            sleep(delay)
+    raise RuntimeError("FineWeb dataset load exhausted retry attempts")
 
 
 def create_and_upload_shards(
@@ -1244,8 +1404,7 @@ def run(
             return result
 
         hf_cache = temp_root / "hf-cache"
-        os.environ["HF_HOME"] = str(hf_cache)
-        os.environ["HF_DATASETS_CACHE"] = str(hf_cache / "datasets")
+        configure_huggingface_cache(hf_cache)
         vocabulary_size = tokenizer().n_vocab
 
         phase = "resume_validation"

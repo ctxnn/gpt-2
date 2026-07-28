@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
@@ -24,6 +25,7 @@ from scripts.prepare_fineweb_to_s3 import (
     atomic_write_npy,
     build_manifest,
     calculate_disk_budget,
+    configure_huggingface_cache,
     create_and_upload_shards,
     final_validation,
     load_progress,
@@ -286,7 +288,8 @@ def test_disk_budget_is_derived_from_shard_size() -> None:
     small = calculate_disk_budget(shard_size=4)
     normal = calculate_disk_budget(shard_size=100_000_000)
     assert normal.required_gib > small.required_gib
-    assert normal.required_gib < 20
+    assert normal.required_gib < 60
+    assert normal.source_cache_gib == 48.0
     assert normal.required_gib != 80
     assert normal.active_token_buffer_gib < 1
     assert normal.in_progress_shard_gib < 1
@@ -296,7 +299,7 @@ def test_disk_calculation_uses_actual_filesystem_availability(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    usage = type("Usage", (), {"total": 100 * 1024**3, "used": 88 * 1024**3, "free": 12 * 1024**3})()
+    usage = type("Usage", (), {"total": 100 * 1024**3, "used": 40 * 1024**3, "free": 60 * 1024**3})()
     monkeypatch.setattr(
         "scripts.prepare_fineweb_to_s3.shutil.disk_usage",
         lambda _: usage,
@@ -306,8 +309,8 @@ def test_disk_calculation_uses_actual_filesystem_availability(
         lambda _: ("/dev/test", "/work"),
     )
     facts = require_free_disk(tmp_path, shard_size=100_000_000)
-    assert facts.available_bytes == 12 * 1024**3
-    assert facts.available_gib == 12
+    assert facts.available_bytes == 60 * 1024**3
+    assert facts.available_gib == 60
     assert facts.mount_path == "/work"
     assert facts.budget.required_gib < facts.available_gib
 
@@ -321,7 +324,7 @@ def test_disk_preflight_rejects_genuinely_insufficient_space(
         "scripts.prepare_fineweb_to_s3.shutil.disk_usage",
         lambda _: usage,
     )
-    with pytest.raises(RuntimeError, match="calculated streaming preparation budget"):
+    with pytest.raises(RuntimeError, match="calculated preparation budget"):
         require_free_disk(tmp_path, shard_size=100_000_000)
 
 
@@ -344,7 +347,8 @@ def test_work_base_selects_filesystem_with_most_free_space(
     assert select_work_base([low, high]) == high
 
 
-def test_streaming_loader_requests_ordered_stream(
+def test_cached_loader_requests_non_streaming_dataset(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: dict[str, Any] = {}
@@ -353,14 +357,104 @@ def test_streaming_loader_requests_ordered_stream(
     def fake_load_dataset(*args: Any, **kwargs: Any):
         calls["args"] = args
         calls["kwargs"] = kwargs
-        return iter(documents)
+        return documents
 
     monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
-    assert list(load_source_dataset()) == documents
+    cache_root = tmp_path / "hf-cache"
+    assert list(load_source_dataset(cache_root)) == documents
     assert calls["args"] == ("HuggingFaceFW/fineweb-edu",)
     assert calls["kwargs"]["name"] == "sample-10BT"
     assert calls["kwargs"]["split"] == "train"
-    assert calls["kwargs"]["streaming"] is True
+    assert calls["kwargs"]["streaming"] is False
+    assert calls["kwargs"]["cache_dir"] == str(cache_root / "datasets")
+    assert Path(calls["kwargs"]["cache_dir"]).is_dir()
+
+
+def test_huggingface_cache_and_timeout_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("HF_DATASETS_CACHE", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_HUB_DOWNLOAD_TIMEOUT", raising=False)
+    monkeypatch.delenv("HF_HUB_ETAG_TIMEOUT", raising=False)
+    cache_root = configure_huggingface_cache(tmp_path / "hf-cache")
+    assert cache_root == tmp_path / "hf-cache"
+    assert os.environ["HF_HOME"] == str(cache_root)
+    assert os.environ["HF_DATASETS_CACHE"] == str(cache_root / "datasets")
+    assert os.environ["HF_HUB_CACHE"] == str(cache_root / "hub")
+    assert os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] == "120"
+    assert os.environ["HF_HUB_ETAG_TIMEOUT"] == "30"
+
+
+def test_transient_dataset_load_retries_using_same_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    sleeps: list[float] = []
+    failures = [TimeoutError("download timed out"), ConnectionError("reset")]
+    documents = [{"text": "cached"}]
+
+    def fake_load_dataset(*_: Any, **kwargs: Any):
+        calls.append(kwargs)
+        if failures:
+            raise failures.pop(0)
+        return documents
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    result = load_source_dataset(
+        tmp_path / "hf-cache",
+        attempts=5,
+        sleep=sleeps.append,
+    )
+    assert list(result) == documents
+    assert len(calls) == 3
+    assert {call["cache_dir"] for call in calls} == {
+        str(tmp_path / "hf-cache" / "datasets")
+    }
+    assert sleeps == [2.0, 4.0]
+
+
+def test_permanent_dataset_error_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_load_dataset(*_: Any, **__: Any):
+        nonlocal calls
+        calls += 1
+        raise ValueError("invalid authentication configuration")
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    with pytest.raises(ValueError, match="invalid authentication"):
+        load_source_dataset(tmp_path / "hf-cache", attempts=5, sleep=lambda _: None)
+    assert calls == 1
+
+
+def test_retry_logs_redact_credentials(
+    environment: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", environment["AWS_ACCESS_KEY_ID"])
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", environment["AWS_SECRET_ACCESS_KEY"])
+
+    def fake_load_dataset(*_: Any, **__: Any):
+        raise RuntimeError(
+            "temporary server error "
+            f"{environment['AWS_ACCESS_KEY_ID']} {environment['AWS_SECRET_ACCESS_KEY']}"
+        )
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    with caplog.at_level(logging.WARNING, logger="fineweb_s3"):
+        with pytest.raises(RuntimeError, match="temporary server error"):
+            load_source_dataset(tmp_path / "hf-cache", attempts=2, sleep=lambda _: None)
+    assert environment["AWS_ACCESS_KEY_ID"] not in caplog.text
+    assert environment["AWS_SECRET_ACCESS_KEY"] not in caplog.text
 
 
 def test_failed_upload_preserves_local_shard(
@@ -455,6 +549,7 @@ def test_progressive_shard_upload_and_progress_updates(
         "edufineweb_train_000002.npy",
     ]
     assert len(client.uploads) == 3
+    assert not list(tmp_path.glob("*.npy"))
     stored_progress = json.loads(
         client.objects[
             (settings.bucket, settings.key(METADATA_PREFIX, PROGRESS_NAME))
@@ -678,7 +773,9 @@ def test_numeric_shard_validation_is_used() -> None:
 
 def test_complete_written_only_after_full_success(
     settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("scripts.prepare_fineweb_to_s3.DATASET_CACHE_GIB", 2.0)
     client = FakeS3()
     result = run(
         settings,
@@ -708,7 +805,40 @@ def test_complete_written_only_after_full_success(
     ) in client.objects
 
 
-def test_complete_absent_on_failure(settings: Settings) -> None:
+def test_s3_probe_precedes_expensive_dataset_load(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("scripts.prepare_fineweb_to_s3.DATASET_CACHE_GIB", 2.0)
+    client = FakeS3()
+    events: list[str] = []
+    original_probe = storage_probe
+
+    def probe_then_record(*args: Any, **kwargs: Any) -> None:
+        original_probe(*args, **kwargs)
+        events.append("probe")
+
+    def loader() -> list[dict[str, Any]]:
+        events.append("load")
+        return []
+
+    monkeypatch.setattr("scripts.prepare_fineweb_to_s3.storage_probe", probe_then_record)
+    with pytest.raises(ValueError, match="exactly one validation shard"):
+        run(
+            settings,
+            client=client,
+            dataset_loader=loader,
+            token_stream_factory=stream_factory([]),
+            shard_size=4,
+        )
+    assert events[:2] == ["probe", "load"]
+
+
+def test_complete_absent_on_failure(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("scripts.prepare_fineweb_to_s3.DATASET_CACHE_GIB", 2.0)
     client = UploadFailureS3()
     with pytest.raises(RuntimeError, match="simulated upload failure"):
         run(
