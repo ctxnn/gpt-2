@@ -227,6 +227,42 @@
         "git_sha": "7a3aceeba543f646a322859c39cfb24c8ec5177a",
         "status": "incomplete"
       }
+    },
+    {
+      "job_id": "job-2cezh",
+      "preparation_run_id": "fineweb-parquet-smoke-20260728T201020Z-2430a3d",
+      "approved_git_sha": "2430a3ddd108f529f11c8c62806c1ba2f380c35b",
+      "branch": "codex/gpt2-h100-training",
+      "entry_point": "python -u -m scripts.prepare_fineweb_to_s3",
+      "source_acquisition": "git-free exact GitHub commit archive",
+      "image": "nvcr.io/nvidia/pytorch:24.01-py3",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T20:10:52.661973+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "smoke_stop_after_verified_shards": 1,
+      "status_at_submission": "submitted",
+      "terminal_status": "build_failed",
+      "finished_at": "2026-07-28T20:57:45.938570+00:00",
+      "attempt": 0,
+      "failure_phase": "platform_image_import",
+      "failure_reason": "GiveMeANode registry rejected the imported image with blob upload invalid before creating a GPU attempt",
+      "source_archive_download": "not_reached",
+      "module_startup": "not_reached",
+      "disk_preflight": "not_reached",
+      "s3_probe": "not_reached",
+      "first_uploaded_shard": null,
+      "complete_marker_written": false,
+      "credentials_in_returned_metadata": false,
+      "platform_spend_after_failure_usd": 0.0,
+      "h100_released": true
     }
   ]
 }
