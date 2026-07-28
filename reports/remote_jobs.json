@@ -172,10 +172,16 @@
       "max_cost_usd": 10.8,
       "max_restarts": 0,
       "status_at_submission": "submitted",
-      "s3_probe": "pending",
-      "dataset_load": "pending",
+      "terminal_status": "failed",
+      "exit_code": 127,
+      "finished_at": "2026-07-28T19:17:17.343309+00:00",
+      "failure_phase": "repository_checkout",
+      "failure_reason": "Selected runtime image does not provide git; command failed before checkout, S3 probe, or FineWeb loading",
+      "s3_probe": "not_reached",
+      "dataset_load": "not_reached",
       "first_uploaded_shard": null,
-      "credentials_in_returned_metadata": false
+      "credentials_in_returned_metadata": false,
+      "platform_spend_after_failure_usd": 0.0
     }
   ]
 }
