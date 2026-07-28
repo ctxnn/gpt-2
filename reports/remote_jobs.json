@@ -152,6 +152,30 @@
         "size_bytes": 10240,
         "state": "ready"
       }
+    },
+    {
+      "job_id": "job-rdcwt",
+      "preparation_run_id": "fineweb10b-cached-20260729-a437c05",
+      "approved_git_sha": "a437c0526d4a11ae986e2fe5c7089f54db6f8cd3",
+      "branch": "codex/gpt2-h100-training",
+      "entry_point": "python -u -m scripts.prepare_fineweb_to_s3",
+      "image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T19:02:07.347334+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "submitted",
+      "s3_probe": "pending",
+      "dataset_load": "pending",
+      "first_uploaded_shard": null,
+      "credentials_in_returned_metadata": false
     }
   ]
 }
