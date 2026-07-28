@@ -29,6 +29,35 @@
       "s3_probe": "not_reached",
       "first_uploaded_shard": null,
       "platform_spend_after_failure_usd": 0.0
+    },
+    {
+      "job_id": "job-sstwa",
+      "preparation_run_id": "fineweb10b-20260728T183017Z-96bb90",
+      "approved_git_sha": "291cfd584c4a34fbb5c14e074284401dd85ae502",
+      "branch": "codex/gpt2-h100-training",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T18:30:49.730433+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "queued",
+      "terminal_status": "failed",
+      "exit_code": 1,
+      "failure_phase": "disk_preflight",
+      "failure_reason": "Batch filesystem had less than the required 80 GiB free",
+      "git_checkout_verification": {
+        "passed": true,
+        "verified_sha": "291cfd584c4a34fbb5c14e074284401dd85ae502"
+      },
+      "s3_probe": "not_reached",
+      "first_uploaded_shard": null,
+      "platform_spend_after_failure_usd": 0.0
     }
   ]
 }
