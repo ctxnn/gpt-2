@@ -28,6 +28,7 @@ from scripts.prepare_fineweb_to_s3 import (
     configure_huggingface_cache,
     create_and_upload_shards,
     final_validation,
+    git_sha,
     load_progress,
     load_source_dataset,
     parse_remote_shard_name,
@@ -248,6 +249,38 @@ def test_credentials_never_appear_in_logs(
     assert environment["AWS_ACCESS_KEY_ID"] not in caplog.text
     assert environment["AWS_SECRET_ACCESS_KEY"] not in caplog.text
     assert environment["GMN_DATA_BUCKET"] in caplog.text
+
+
+def test_explicit_source_sha_does_not_require_git(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = "A" * 40
+    monkeypatch.setenv("GMN_SOURCE_GIT_SHA", expected)
+
+    def git_must_not_run(*_: Any, **__: Any) -> None:
+        raise AssertionError("git metadata should not be queried when SHA is explicit")
+
+    monkeypatch.setattr("scripts.prepare_fineweb_to_s3.subprocess.run", git_must_not_run)
+    assert git_sha() == expected.lower()
+
+
+def test_git_sha_returns_null_when_git_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GMN_SOURCE_GIT_SHA", raising=False)
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_to_s3.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError("git")),
+    )
+    assert git_sha() is None
+
+
+def test_invalid_explicit_source_sha_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GMN_SOURCE_GIT_SHA", "not-a-sha")
+    with pytest.raises(ValueError, match="40-character hexadecimal"):
+        git_sha()
 
 
 def test_successful_s3_probe_leaves_no_object(settings: Settings) -> None:

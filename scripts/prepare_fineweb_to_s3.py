@@ -58,6 +58,7 @@ CHECKSUMS_NAME = "checksums.sha256"
 REPORT_NAME = "preparation_report.md"
 COMPLETE_NAME = "COMPLETE"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+GIT_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 GIB = 1024**3
 # FineWeb is loaded through the ordinary cached Hugging Face path.  This is a
 # conservative allowance for the compressed source files and their metadata;
@@ -227,14 +228,25 @@ def create_s3_client(settings: Settings):
     )
 
 
-def git_sha() -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
+def git_sha() -> str | None:
+    """Return the authoritative source SHA without requiring git metadata."""
+
+    explicit = os.environ.get("GMN_SOURCE_GIT_SHA", "").strip()
+    if explicit:
+        if GIT_SHA_PATTERN.fullmatch(explicit) is None:
+            raise ValueError("GMN_SOURCE_GIT_SHA must be a 40-character hexadecimal SHA")
+        return explicit.lower()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    discovered = result.stdout.strip()
+    return discovered or None
 
 
 def filesystem_identity(path: Path) -> tuple[str, str]:
@@ -1102,7 +1114,7 @@ def build_manifest(
     records: Sequence[Mapping[str, Any]],
     validation: Mapping[str, Any],
     *,
-    preparation_git_sha: str,
+    preparation_git_sha: str | None,
     preparation_started_at: str,
     preparation_finished_at: str,
     disk_facts: DiskFacts | None = None,
