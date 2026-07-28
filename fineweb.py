@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import tiktoken
@@ -20,6 +22,19 @@ from tqdm import tqdm
 DATASET_ID = "HuggingFaceFW/fineweb-edu"
 DEFAULT_DATASET_CONFIG = "sample-10BT"
 DEFAULT_SHARD_SIZE = 100_000_000
+
+_SHARD_FILENAME = re.compile(
+    r"^edufineweb_(?P<split>[A-Za-z]+)_(?P<index>\d{6})\.npy$"
+)
+
+
+@dataclass(frozen=True)
+class ShardFile:
+    """A validated FineWeb-Edu shard, ordered by its numeric index."""
+
+    path: Path
+    split: str
+    index: int
 
 _tokenizer = None
 
@@ -42,6 +57,60 @@ def tokenize(document: dict[str, Any]) -> np.ndarray:
 
 def write_datafile(filename: str | Path, tokens: np.ndarray) -> None:
     np.save(filename, tokens)
+
+
+def validate_shard_filenames(paths: Iterable[str | Path]) -> list[ShardFile]:
+    """Validate FineWeb-Edu shard names and return them in numeric order.
+
+    Call this with every entry in the shard directory (for example,
+    ``output_dir.iterdir()``), rather than a glob that would hide unexpected
+    files. The result is validation shard zero followed by training shards in
+    numeric order.
+    """
+
+    shards: list[ShardFile] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        match = _SHARD_FILENAME.fullmatch(path.name)
+        if match is None:
+            if path.name.startswith("edufineweb_"):
+                raise ValueError(f"malformed shard filename: {path.name}")
+            raise ValueError(f"unexpected file in shard directory: {path.name}")
+
+        split = match.group("split")
+        if split not in {"train", "val"}:
+            raise ValueError(f"invalid shard split {split!r} in {path.name}")
+        shards.append(ShardFile(path=path, split=split, index=int(match.group("index"))))
+
+    validation_shards = [shard for shard in shards if shard.split == "val"]
+    if len(validation_shards) != 1:
+        raise ValueError(
+            f"expected exactly one validation shard, found {len(validation_shards)}"
+        )
+    if validation_shards[0].index != 0:
+        raise ValueError(
+            "validation shard must have numeric index 0, "
+            f"found {validation_shards[0].index}"
+        )
+
+    training_shards = [shard for shard in shards if shard.split == "train"]
+    training_indices = [shard.index for shard in training_shards]
+    duplicate_indices = sorted(
+        index for index in set(training_indices) if training_indices.count(index) > 1
+    )
+    if duplicate_indices:
+        raise ValueError(f"duplicate training shard indices: {duplicate_indices}")
+    if not training_indices:
+        raise ValueError("no training shards found")
+
+    final_training_index = max(training_indices)
+    expected_indices = set(range(1, final_training_index + 1))
+    actual_indices = set(training_indices)
+    missing_indices = sorted(expected_indices - actual_indices)
+    if missing_indices:
+        raise ValueError(f"missing training shard indices: {missing_indices}")
+
+    return sorted(shards, key=lambda shard: shard.index)
 
 
 def prepare_dataset(
@@ -94,6 +163,7 @@ def prepare_dataset(
             )
             if progress is not None:
                 progress.close()
+    validate_shard_filenames(output.iterdir())
 
 
 def main() -> int:
