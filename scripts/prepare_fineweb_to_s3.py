@@ -1403,7 +1403,7 @@ def run(
             )
             return result
 
-        hf_cache = temp_root / "hf-cache"
+        hf_cache = Path(os.environ.get("HF_HOME") or (temp_root / "hf-cache"))
         configure_huggingface_cache(hf_cache)
         vocabulary_size = tokenizer().n_vocab
 
