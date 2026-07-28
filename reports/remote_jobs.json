@@ -1,0 +1,34 @@
+{
+  "jobs": [
+    {
+      "job_id": "job-tvzbk",
+      "preparation_run_id": "fineweb10b-291cfd5-20260728-01",
+      "pushed_git_sha": "291cfd584c4a34fbb5c14e074284401dd85ae502",
+      "requested_checkout_sha": "291cfd5ecba7b70d3c9108006e8b59a5e56685b3",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T18:23:43.975098+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "submitted",
+      "terminal_status": "failed",
+      "exit_code": 128,
+      "failure_phase": "git_checkout",
+      "failure_reason": "Submitted checkout SHA was not present on the remote branch",
+      "gpu_startup_check": {
+        "passed": true,
+        "visible_gpu_count": 1,
+        "model": "NVIDIA H100 80GB HBM3"
+      },
+      "s3_probe": "not_reached",
+      "first_uploaded_shard": null,
+      "platform_spend_after_failure_usd": 0.0
+    }
+  ]
+}
