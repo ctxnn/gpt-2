@@ -12,10 +12,9 @@ import random
 import re
 import shutil
 import subprocess
-import tempfile
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
@@ -39,7 +38,6 @@ LOGGER = logging.getLogger("fineweb_s3")
 TOKENIZER_NAME = "gpt2"
 SHARD_FORMAT = "NumPy .npy"
 DTYPE = np.dtype(np.uint16)
-MIN_FREE_GIB = 80
 REQUIRED_ENVIRONMENT = (
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -59,6 +57,12 @@ CHECKSUMS_NAME = "checksums.sha256"
 REPORT_NAME = "preparation_report.md"
 COMPLETE_NAME = "COMPLETE"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+GIB = 1024**3
+STREAMING_SOURCE_CACHE_GIB = 2.0
+DEPENDENCY_INSTALL_HEADROOM_GIB = 3.0
+UPLOAD_HEADROOM_GIB = 0.5
+METADATA_HEADROOM_GIB = 0.1
+SAFETY_MARGIN_GIB = 2.0
 
 
 def utc_now() -> str:
@@ -127,6 +131,67 @@ class Settings:
         return urlparse(self.endpoint_url).hostname or ""
 
 
+@dataclass(frozen=True)
+class DiskBudget:
+    """Conservative peak-disk estimate for streaming, progressive prep.
+
+    Streaming avoids materializing FineWeb locally. The budget accounts for
+    metadata/cache fragments, dependency installation, one uint16 token
+    buffer, one shard during atomic write/upload, one validation download,
+    upload overhead, and a safety margin. Verified shards are deleted after
+    remote size/SHA verification, so completed shards do not accumulate.
+    """
+
+    source_cache_gib: float
+    dependency_headroom_gib: float
+    active_token_buffer_gib: float
+    in_progress_shard_gib: float
+    upload_headroom_gib: float
+    validation_download_gib: float
+    metadata_headroom_gib: float
+    safety_margin_gib: float
+    required_gib: float
+
+
+@dataclass(frozen=True)
+class DiskFacts:
+    filesystem: str
+    mount_path: str
+    path: str
+    total_bytes: int
+    used_bytes: int
+    available_bytes: int
+    total_gib: float
+    used_gib: float
+    available_gib: float
+    budget: DiskBudget
+
+
+def calculate_disk_budget(shard_size: int = DEFAULT_SHARD_SIZE) -> DiskBudget:
+    shard_gib = (shard_size * DTYPE.itemsize) / GIB
+    required = (
+        STREAMING_SOURCE_CACHE_GIB
+        + DEPENDENCY_INSTALL_HEADROOM_GIB
+        + shard_gib
+        + shard_gib
+        + UPLOAD_HEADROOM_GIB
+        + shard_gib
+        + METADATA_HEADROOM_GIB
+        + SAFETY_MARGIN_GIB
+    )
+    return DiskBudget(
+        source_cache_gib=STREAMING_SOURCE_CACHE_GIB,
+        dependency_headroom_gib=DEPENDENCY_INSTALL_HEADROOM_GIB,
+        active_token_buffer_gib=shard_gib,
+        in_progress_shard_gib=shard_gib,
+        upload_headroom_gib=UPLOAD_HEADROOM_GIB,
+        validation_download_gib=shard_gib,
+        metadata_headroom_gib=METADATA_HEADROOM_GIB,
+        safety_margin_gib=SAFETY_MARGIN_GIB,
+        required_gib=round(required, 3),
+    )
+
+
 def configure_logging() -> None:
     logging.disable(logging.DEBUG)
     logging.basicConfig(
@@ -164,15 +229,66 @@ def git_sha() -> str:
     return result.stdout.strip()
 
 
-def require_free_disk(path: Path, minimum_gib: int = MIN_FREE_GIB) -> int:
-    path.mkdir(parents=True, exist_ok=True)
-    free = shutil.disk_usage(path).free
-    required = minimum_gib * 1024**3
-    if free < required:
-        raise RuntimeError(
-            f"insufficient local disk: require at least {minimum_gib} GiB free"
+def filesystem_identity(path: Path) -> tuple[str, str]:
+    try:
+        result = subprocess.run(
+            ["df", "-P", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-    return free
+        fields = result.stdout.strip().splitlines()[-1].split()
+        if len(fields) >= 6:
+            return fields[0], " ".join(fields[5:])
+    except (OSError, subprocess.CalledProcessError, IndexError):
+        pass
+    return "unknown", str(path)
+
+
+def select_work_base(candidates: Sequence[Path] | None = None) -> Path:
+    options = list(candidates or (Path.cwd(), Path("/tmp")))
+    existing = [path for path in options if path.exists()]
+    if not existing:
+        raise RuntimeError("no usable work filesystem was found")
+    return max(existing, key=lambda path: shutil.disk_usage(path).free)
+
+
+def require_free_disk(
+    path: Path,
+    *,
+    shard_size: int = DEFAULT_SHARD_SIZE,
+) -> DiskFacts:
+    path.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(path)
+    budget = calculate_disk_budget(shard_size)
+    filesystem, mount_path = filesystem_identity(path)
+    facts = DiskFacts(
+        filesystem=filesystem,
+        mount_path=mount_path,
+        path=str(path),
+        total_bytes=usage.total,
+        used_bytes=usage.used,
+        available_bytes=usage.free,
+        total_gib=round(usage.total / GIB, 3),
+        used_gib=round(usage.used / GIB, 3),
+        available_gib=round(usage.free / GIB, 3),
+        budget=budget,
+    )
+    LOGGER.info(
+        "disk filesystem=%s mount=%s path=%s available_gib=%.3f required_gib=%.3f "
+        "safety_margin_gib=%.3f",
+        facts.filesystem,
+        facts.mount_path,
+        facts.path,
+        facts.available_gib,
+        facts.budget.required_gib,
+        facts.budget.safety_margin_gib,
+    )
+    if usage.free < budget.required_gib * GIB:
+        raise RuntimeError(
+            "insufficient local disk for calculated streaming preparation budget"
+        )
+    return facts
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -572,10 +688,14 @@ def tokenized_documents(
 def load_source_dataset() -> Iterable[dict[str, Any]]:
     from datasets import load_dataset
 
+    # A single streaming split yields source documents in dataset order. The
+    # downstream multiprocessing path uses Pool.imap, which preserves input
+    # order while tokenizing, so shard boundaries remain deterministic.
     return load_dataset(
         DATASET_ID,
         name=DEFAULT_DATASET_CONFIG,
         split="train",
+        streaming=True,
         cache_dir=os.environ.get("HF_DATASETS_CACHE"),
     )
 
@@ -609,6 +729,7 @@ def create_and_upload_shards(
             shard_index += 1
             return
         destination = work_dir / filename
+        verified_remote = False
         try:
             atomic_write_npy(destination, tokens)
             record = upload_verified_shard(
@@ -623,8 +744,10 @@ def create_and_upload_shards(
             )
             replace_progress_record(progress, record)
             upload_progress(client, settings, progress)
+            verified_remote = True
         finally:
-            destination.unlink(missing_ok=True)
+            if verified_remote:
+                destination.unlink(missing_ok=True)
         shard_index += 1
 
     with token_stream_factory(dataset) as tokenized_stream:
@@ -697,8 +820,7 @@ def sample_indices(count: int) -> list[int]:
     return sorted(index for index in candidates if 0 <= index < count)
 
 
-def verify_random_batch(paths: Sequence[Path]) -> dict[str, int]:
-    arrays = [np.load(path, allow_pickle=False, mmap_mode="r") for path in paths]
+def verify_random_batch(arrays: Sequence[np.ndarray]) -> dict[str, int]:
     available = [array for array in arrays if array.size >= 2]
     if not available:
         raise ValueError("no shard has enough tokens to form a training batch")
@@ -766,32 +888,34 @@ def final_validation(
         if position == len(ordered) - 1 and expected_count > shard_size:
             raise ValueError(f"final shard exceeds shard size: {shard.path.name}")
 
-    sampled_paths: list[Path] = []
+    sampled_arrays: list[np.ndarray] = []
     sampled_names: list[str] = []
     for index in sample_indices(len(ordered)):
         shard = ordered[index]
         record = records_by_name[shard.path.name]
         destination = work_dir / f"sample-{shard.path.name}"
-        token_count, local_bytes, actual_sha = inspect_downloaded_shard(
-            client,
-            settings,
-            str(record["remote_key"]),
-            destination,
-            shard_size=shard_size,
-            allow_partial=index == len(ordered) - 1,
-            vocabulary_size=vocabulary_size,
-        )
-        if token_count != int(record["token_count"]):
-            raise ValueError(f"sample token count mismatch for {shard.path.name}")
-        if local_bytes != int(record["remote_bytes"]):
-            raise ValueError(f"sample byte count mismatch for {shard.path.name}")
-        if actual_sha != record["sha256"]:
-            raise ValueError(f"sample SHA-256 mismatch for {shard.path.name}")
-        sampled_paths.append(destination)
-        sampled_names.append(shard.path.name)
-    batch = verify_random_batch(sampled_paths)
-    for path in sampled_paths:
-        path.unlink(missing_ok=True)
+        try:
+            token_count, local_bytes, actual_sha = inspect_downloaded_shard(
+                client,
+                settings,
+                str(record["remote_key"]),
+                destination,
+                shard_size=shard_size,
+                allow_partial=index == len(ordered) - 1,
+                vocabulary_size=vocabulary_size,
+            )
+            if token_count != int(record["token_count"]):
+                raise ValueError(f"sample token count mismatch for {shard.path.name}")
+            if local_bytes != int(record["remote_bytes"]):
+                raise ValueError(f"sample byte count mismatch for {shard.path.name}")
+            if actual_sha != record["sha256"]:
+                raise ValueError(f"sample SHA-256 mismatch for {shard.path.name}")
+            sampled = np.load(destination, allow_pickle=False, mmap_mode="r")
+            sampled_arrays.append(np.array(sampled[: min(128, sampled.size)]))
+            sampled_names.append(shard.path.name)
+        finally:
+            destination.unlink(missing_ok=True)
+    batch = verify_random_batch(sampled_arrays)
 
     val_count = sum(1 for shard in ordered if shard.split == "val")
     train_count = sum(1 for shard in ordered if shard.split == "train")
@@ -821,6 +945,7 @@ def build_manifest(
     preparation_git_sha: str,
     preparation_started_at: str,
     preparation_finished_at: str,
+    disk_facts: DiskFacts | None = None,
     shard_size: int,
 ) -> dict[str, Any]:
     ordered = sorted(records, key=lambda item: int(item["index"]))
@@ -838,6 +963,22 @@ def build_manifest(
         "preparation_command": "python scripts/prepare_fineweb_to_s3.py",
         "preparation_started_at": preparation_started_at,
         "preparation_finished_at": preparation_finished_at,
+        "disk_preflight": (
+            {
+                "filesystem": disk_facts.filesystem,
+                "mount_path": disk_facts.mount_path,
+                "work_path": disk_facts.path,
+                "total_bytes": disk_facts.total_bytes,
+                "used_bytes": disk_facts.used_bytes,
+                "available_bytes": disk_facts.available_bytes,
+                "total_gib": disk_facts.total_gib,
+                "used_gib": disk_facts.used_gib,
+                "available_gib": disk_facts.available_gib,
+                "budget": asdict(disk_facts.budget),
+            }
+            if disk_facts is not None
+            else None
+        ),
         "bucket": settings.bucket,
         "prefix": settings.prefix,
         "shard_count": len(ordered),
@@ -880,6 +1021,17 @@ def build_report(
                 f"- Bytes: {manifest['total_bytes']}",
             ]
         )
+        disk = manifest.get("disk_preflight")
+        if disk:
+            lines.extend(
+                [
+                    f"- Disk filesystem: {disk['filesystem']}",
+                    f"- Disk mount: {disk['mount_path']}",
+                    f"- Disk available GiB: {disk['available_gib']}",
+                    f"- Disk required GiB: {disk['budget']['required_gib']}",
+                    "- Disk model: streaming source/cache with progressive shard upload and local deletion",
+                ]
+            )
     if failure_type:
         lines.append(f"- Failure type: {failure_type}")
     lines.append("")
@@ -995,7 +1147,6 @@ def run(
         [Iterable[dict[str, Any]]], Any
     ] = tokenized_documents,
     shard_size: int = DEFAULT_SHARD_SIZE,
-    minimum_free_gib: int = MIN_FREE_GIB,
 ) -> dict[str, Any]:
     active_client = client or create_s3_client(settings)
     current_sha = git_sha()
@@ -1012,11 +1163,9 @@ def run(
         current_sha,
     )
 
-    temp_root = (
-        Path(tempfile.gettempdir())
-        / f"fineweb-s3-{settings.preparation_run_id}"
-    )
-    free_bytes = require_free_disk(temp_root, minimum_free_gib)
+    work_base = select_work_base()
+    temp_root = work_base / "fineweb-s3" / settings.preparation_run_id
+    disk_facts = require_free_disk(temp_root, shard_size=shard_size)
     phase = "storage_probe"
     progress: dict[str, Any] = {
         "schema_version": 1,
@@ -1050,8 +1199,16 @@ def run(
                 "prefix": settings.prefix,
                 "endpoint_hostname": settings.endpoint_hostname,
                 "region": settings.region,
-                "free_bytes": free_bytes,
-                "minimum_required_gib": minimum_free_gib,
+                "filesystem": disk_facts.filesystem,
+                "mount_path": disk_facts.mount_path,
+                "work_path": disk_facts.path,
+                "total_bytes": disk_facts.total_bytes,
+                "used_bytes": disk_facts.used_bytes,
+                "available_bytes": disk_facts.available_bytes,
+                "total_gib": disk_facts.total_gib,
+                "used_gib": disk_facts.used_gib,
+                "available_gib": disk_facts.available_gib,
+                "disk_budget": asdict(disk_facts.budget),
                 "storage_probe_passed": True,
             },
         )
@@ -1145,6 +1302,7 @@ def run(
             preparation_git_sha=current_sha,
             preparation_started_at=started_at,
             preparation_finished_at=finished_at,
+            disk_facts=disk_facts,
             shard_size=shard_size,
         )
 

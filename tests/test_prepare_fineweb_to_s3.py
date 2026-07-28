@@ -23,10 +23,15 @@ from scripts.prepare_fineweb_to_s3 import (
     atomic_write_bytes,
     atomic_write_npy,
     build_manifest,
+    calculate_disk_budget,
     create_and_upload_shards,
+    final_validation,
     load_progress,
+    load_source_dataset,
     parse_remote_shard_name,
+    require_free_disk,
     run,
+    select_work_base,
     sha256_bytes,
     sha256_file,
     storage_probe,
@@ -275,6 +280,151 @@ def test_sha256_generation(tmp_path: Path) -> None:
     expected = hashlib.sha256(content).hexdigest()
     assert sha256_bytes(content) == expected
     assert sha256_file(path) == expected
+
+
+def test_disk_budget_is_derived_from_shard_size() -> None:
+    small = calculate_disk_budget(shard_size=4)
+    normal = calculate_disk_budget(shard_size=100_000_000)
+    assert normal.required_gib > small.required_gib
+    assert normal.required_gib < 20
+    assert normal.required_gib != 80
+    assert normal.active_token_buffer_gib < 1
+    assert normal.in_progress_shard_gib < 1
+
+
+def test_disk_calculation_uses_actual_filesystem_availability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    usage = type("Usage", (), {"total": 100 * 1024**3, "used": 88 * 1024**3, "free": 12 * 1024**3})()
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_to_s3.shutil.disk_usage",
+        lambda _: usage,
+    )
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_to_s3.filesystem_identity",
+        lambda _: ("/dev/test", "/work"),
+    )
+    facts = require_free_disk(tmp_path, shard_size=100_000_000)
+    assert facts.available_bytes == 12 * 1024**3
+    assert facts.available_gib == 12
+    assert facts.mount_path == "/work"
+    assert facts.budget.required_gib < facts.available_gib
+
+
+def test_disk_preflight_rejects_genuinely_insufficient_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    usage = type("Usage", (), {"total": 100 * 1024**3, "used": 93 * 1024**3, "free": 7 * 1024**3})()
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_to_s3.shutil.disk_usage",
+        lambda _: usage,
+    )
+    with pytest.raises(RuntimeError, match="calculated streaming preparation budget"):
+        require_free_disk(tmp_path, shard_size=100_000_000)
+
+
+def test_work_base_selects_filesystem_with_most_free_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    low = tmp_path / "low"
+    high = tmp_path / "high"
+    low.mkdir()
+    high.mkdir()
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_to_s3.shutil.disk_usage",
+        lambda path: type(
+            "Usage",
+            (),
+            {"free": 1 if path == low else 2},
+        )(),
+    )
+    assert select_work_base([low, high]) == high
+
+
+def test_streaming_loader_requests_ordered_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, Any] = {}
+    documents = [{"text": "first"}, {"text": "second"}]
+
+    def fake_load_dataset(*args: Any, **kwargs: Any):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return iter(documents)
+
+    monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+    assert list(load_source_dataset()) == documents
+    assert calls["args"] == ("HuggingFaceFW/fineweb-edu",)
+    assert calls["kwargs"]["name"] == "sample-10BT"
+    assert calls["kwargs"]["split"] == "train"
+    assert calls["kwargs"]["streaming"] is True
+
+
+def test_failed_upload_preserves_local_shard(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    client = UploadFailureS3()
+    with pytest.raises(RuntimeError, match="simulated upload failure"):
+        create_and_upload_shards(
+            client,
+            settings,
+            {"shards": []},
+            {},
+            tmp_path,
+            dataset=[],
+            token_stream_factory=stream_factory(
+                [np.array([1, 2, 3, 4], dtype=np.uint16)]
+            ),
+            shard_size=4,
+            vocabulary_size=50_257,
+        )
+    assert (tmp_path / "edufineweb_val_000000.npy").exists()
+
+
+def test_validation_downloads_are_cleaned(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    client = FakeS3()
+    records = [
+        seed_shard(
+            client,
+            settings,
+            tmp_path,
+            "edufineweb_val_000000.npy",
+            np.array([1, 2, 3, 4], dtype=np.uint16),
+            shard_size=4,
+        ),
+        seed_shard(
+            client,
+            settings,
+            tmp_path,
+            "edufineweb_train_000001.npy",
+            np.array([5, 6, 7, 8], dtype=np.uint16),
+            shard_size=4,
+        ),
+        seed_shard(
+            client,
+            settings,
+            tmp_path,
+            "edufineweb_train_000002.npy",
+            np.array([9, 10], dtype=np.uint16),
+            shard_size=4,
+        ),
+    ]
+    final_validation(
+        client,
+        settings,
+        records,
+        tmp_path,
+        shard_size=4,
+        vocabulary_size=50_257,
+    )
+    assert not list(tmp_path.glob("sample-*.npy"))
 
 
 def test_progressive_shard_upload_and_progress_updates(
@@ -538,7 +688,6 @@ def test_complete_written_only_after_full_success(
             [np.array([1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.uint16)]
         ),
         shard_size=4,
-        minimum_free_gib=0,
     )
     complete_key = settings.key(STATUS_PREFIX, COMPLETE_NAME)
     assert result["status"] == "complete"
@@ -570,7 +719,6 @@ def test_complete_absent_on_failure(settings: Settings) -> None:
                 [np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.uint16)]
             ),
             shard_size=4,
-            minimum_free_gib=0,
         )
     assert (
         settings.bucket,
