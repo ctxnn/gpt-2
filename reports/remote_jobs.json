@@ -58,6 +58,51 @@
       "s3_probe": "not_reached",
       "first_uploaded_shard": null,
       "platform_spend_after_failure_usd": 0.0
+    },
+    {
+      "job_id": "job-hejvv",
+      "preparation_run_id": "fineweb10b-20260728T184038Z-501ef6",
+      "approved_git_sha": "3e018cf8b42b72d58301205619155d52319b1211",
+      "branch": "codex/gpt2-h100-training",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T18:41:13.448031+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "queued",
+      "terminal_status": "failed",
+      "exit_code": 1,
+      "failure_phase": "workload_import",
+      "failure_reason": "python scripts/prepare_fineweb_to_s3.py could not import fineweb from the repository root",
+      "filesystem_facts": {
+        "filesystem": "overlay",
+        "mount_path": "/",
+        "paths": ["/tmp", "/workspace", "/workspace/gpt-2"],
+        "same_filesystem": true,
+        "total_bytes": 1598228955136,
+        "used_bytes": 1505086132224,
+        "available_bytes": 93126045696,
+        "available_gib": 86.73
+      },
+      "git_checkout_verification": {
+        "passed": true,
+        "verified_sha": "3e018cf8b42b72d58301205619155d52319b1211"
+      },
+      "gpu_startup_check": {
+        "passed": true,
+        "visible_gpu_count": 1,
+        "model": "NVIDIA H100 80GB HBM3"
+      },
+      "disk_budget_check": "not_reached_by_script",
+      "s3_probe": "not_reached",
+      "first_uploaded_shard": null,
+      "platform_spend_after_failure_usd": 0.0
     }
   ]
 }
