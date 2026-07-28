@@ -204,14 +204,29 @@
       "max_cost_usd": 10.8,
       "max_restarts": 0,
       "status_at_submission": "queued",
-      "archive_download": "pending",
-      "repository_extraction": "pending",
-      "module_startup": "pending",
-      "disk_preflight": "pending",
-      "s3_probe": "pending",
-      "dataset_load": "pending",
+      "terminal_status": "failed",
+      "exit_code": 1,
+      "finished_at": "2026-07-28T19:28:52.332479+00:00",
+      "failure_phase": "dataset_download_and_tokenization",
+      "failure_type": "DatasetGenerationError",
+      "failure_reason": "Ordinary cached FineWeb train-split materialization terminated at approximately 58 percent before tokenization; no shard was uploaded",
+      "archive_download": "passed",
+      "repository_extraction": "passed",
+      "module_startup": "passed",
+      "disk_preflight": {
+        "passed": true,
+        "available_gib": 54.386,
+        "required_gib": 54.159
+      },
+      "s3_probe": "passed_before_dataset_load",
+      "dataset_load": "failed_during_cache_materialization",
       "first_uploaded_shard": null,
-      "credentials_in_returned_metadata": false
+      "credentials_in_returned_metadata": false,
+      "platform_spend_after_failure_usd": 0.0,
+      "result": {
+        "git_sha": "7a3aceeba543f646a322859c39cfb24c8ec5177a",
+        "status": "incomplete"
+      }
     }
   ]
 }
