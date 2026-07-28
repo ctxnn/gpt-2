@@ -321,8 +321,8 @@ def test_disk_budget_is_derived_from_shard_size() -> None:
     small = calculate_disk_budget(shard_size=4)
     normal = calculate_disk_budget(shard_size=100_000_000)
     assert normal.required_gib > small.required_gib
-    assert normal.required_gib < 60
-    assert normal.source_cache_gib == 48.0
+    assert normal.required_gib < 12
+    assert normal.source_cache_gib == 3.0
     assert normal.required_gib != 80
     assert normal.active_token_buffer_gib < 1
     assert normal.in_progress_shard_gib < 1

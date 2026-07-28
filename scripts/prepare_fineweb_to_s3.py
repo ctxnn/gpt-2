@@ -34,6 +34,7 @@ from fineweb import (
     tokenizer,
     validate_shard_filenames,
 )
+from scripts.sequential_parquet import process_sequential_parquet
 
 LOGGER = logging.getLogger("fineweb_s3")
 TOKENIZER_NAME = "gpt2"
@@ -60,10 +61,9 @@ COMPLETE_NAME = "COMPLETE"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 GIT_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 GIB = 1024**3
-# FineWeb is loaded through the ordinary cached Hugging Face path.  This is a
-# conservative allowance for the compressed source files and their metadata;
-# completed token shards are still removed locally after S3 verification.
-DATASET_CACHE_GIB = 48.0
+# Sequential preparation retains one roughly 2.15 GB Parquet source file, one
+# partial-token checkpoint, and one completed token shard at a time.
+DATASET_CACHE_GIB = 3.0
 DEPENDENCY_INSTALL_HEADROOM_GIB = 3.0
 UPLOAD_HEADROOM_GIB = 0.5
 METADATA_HEADROOM_GIB = 0.1
@@ -142,13 +142,12 @@ class Settings:
 
 @dataclass(frozen=True)
 class DiskBudget:
-    """Conservative peak-disk estimate for cached, progressive preparation.
+    """Conservative peak-disk estimate for sequential Parquet preparation.
 
-    FineWeb is downloaded through the ordinary Hugging Face cache. The budget
-    accounts for that source cache, dependency installation, one uint16 token
-    buffer, one shard during atomic write/upload, one validation download,
-    upload overhead, and a safety margin. Verified shards are deleted after
-    remote size/SHA verification, so completed shards do not accumulate.
+    The budget accounts for one resumable Parquet source, dependency
+    installation, one uint16 token buffer, one shard during atomic
+    write/upload, one validation download, upload overhead, and a safety
+    margin. Source files and verified shards do not accumulate.
     """
 
     source_cache_gib: float
@@ -872,6 +871,19 @@ def load_source_dataset(
     raise RuntimeError("FineWeb dataset load exhausted retry attempts")
 
 
+def stop_after_verified_shards() -> int | None:
+    raw = os.environ.get("GMN_STOP_AFTER_VERIFIED_SHARDS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError("GMN_STOP_AFTER_VERIFIED_SHARDS must be an integer") from error
+    if value < 1:
+        raise ValueError("GMN_STOP_AFTER_VERIFIED_SHARDS must be positive")
+    return value
+
+
 def create_and_upload_shards(
     client: Any,
     settings: Settings,
@@ -1314,7 +1326,7 @@ def run(
     settings: Settings,
     *,
     client: Any | None = None,
-    dataset_loader: Callable[[], Iterable[dict[str, Any]]] = load_source_dataset,
+    dataset_loader: Callable[[], Iterable[dict[str, Any]]] | None = None,
     token_stream_factory: Callable[
         [Iterable[dict[str, Any]]], Any
     ] = tokenized_documents,
@@ -1442,19 +1454,89 @@ def run(
         )
         upload_progress(active_client, settings, progress)
 
-        phase = "dataset_download_and_tokenization"
-        dataset = dataset_loader()
-        records = create_and_upload_shards(
-            active_client,
-            settings,
-            progress,
-            verified,
-            temp_root,
-            dataset=dataset,
-            token_stream_factory=token_stream_factory,
-            shard_size=shard_size,
-            vocabulary_size=vocabulary_size,
-        )
+        phase = "sequential_parquet_tokenization"
+        if dataset_loader is not None:
+            # Test-only compatibility path for existing unit tests. Production
+            # never calls datasets.load_dataset or uses streaming=True.
+            dataset = dataset_loader()
+            records = create_and_upload_shards(
+                active_client,
+                settings,
+                progress,
+                verified,
+                temp_root,
+                dataset=dataset,
+                token_stream_factory=token_stream_factory,
+                shard_size=shard_size,
+                vocabulary_size=vocabulary_size,
+            )
+            sequential_result: dict[str, Any] | None = None
+        else:
+            def upload_for_sequential(
+                path: Path,
+                split: str,
+                index: int,
+                allow_partial: bool,
+            ) -> dict[str, Any]:
+                record = upload_verified_shard(
+                    active_client,
+                    settings,
+                    path,
+                    split=split,
+                    index=index,
+                    shard_size=shard_size,
+                    allow_partial=allow_partial,
+                    vocabulary_size=vocabulary_size,
+                )
+                replace_progress_record(progress, record)
+                upload_progress(active_client, settings, progress)
+                return record
+
+            sequential_result = process_sequential_parquet(
+                active_client,
+                settings,
+                temp_root,
+                source_git_sha=current_sha,
+                shard_size=shard_size,
+                vocabulary_size=vocabulary_size,
+                upload_shard=upload_for_sequential,
+                verified_remote_shards=verified,
+                stop_after_verified_shards=stop_after_verified_shards(),
+            )
+            records = sequential_result["verified_shards"]
+            if sequential_result["status"] == "smoke_complete":
+                complete_key = settings.key(STATUS_PREFIX, COMPLETE_NAME)
+                if object_exists(active_client, settings, complete_key):
+                    raise RuntimeError("smoke mode must not publish COMPLETE")
+                result = {
+                    **sequential_result,
+                    "bucket": settings.bucket,
+                    "prefix": settings.prefix,
+                    "git_sha": current_sha,
+                    "preparation_run_id": settings.preparation_run_id,
+                    "givemeanode_job_id": settings.job_id,
+                    "storage_probe_passed": True,
+                    "disk_preflight": {
+                        "filesystem": disk_facts.filesystem,
+                        "mount_path": disk_facts.mount_path,
+                        "available_bytes": disk_facts.available_bytes,
+                        "available_gib": disk_facts.available_gib,
+                        "required_gib": disk_facts.budget.required_gib,
+                    },
+                    "complete_marker_absent": True,
+                }
+                put_json(
+                    active_client,
+                    settings,
+                    settings.key(
+                        "runs",
+                        settings.preparation_run_id,
+                        "final_status.json",
+                    ),
+                    {**result, "finished_at": utc_now()},
+                )
+                write_small_output(settings, result)
+                return result
 
         phase = "final_validation"
         validation = final_validation(
@@ -1476,6 +1558,23 @@ def run(
             disk_facts=disk_facts,
             shard_size=shard_size,
         )
+        if sequential_result is not None:
+            manifest.update(
+                {
+                    "pinned_dataset_revision": sequential_result[
+                        "pinned_dataset_revision"
+                    ],
+                    "source_manifest_file_count": sequential_result[
+                        "source_manifest_file_count"
+                    ],
+                    "source_manifest_sha256": sequential_result[
+                        "source_manifest_sha256"
+                    ],
+                    "processed_document_count": sequential_result[
+                        "processed_documents"
+                    ],
+                }
+            )
 
         phase = "final_metadata_publication"
         progress["complete"] = True
