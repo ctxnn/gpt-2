@@ -182,6 +182,36 @@
       "first_uploaded_shard": null,
       "credentials_in_returned_metadata": false,
       "platform_spend_after_failure_usd": 0.0
+    },
+    {
+      "job_id": "job-896vk",
+      "preparation_run_id": "fineweb10b-archive-20260729-7a3acee",
+      "approved_git_sha": "7a3aceeba543f646a322859c39cfb24c8ec5177a",
+      "branch": "codex/gpt2-h100-training",
+      "source_archive_url": "https://github.com/ctxnn/gpt-2/archive/7a3aceeba543f646a322859c39cfb24c8ec5177a.tar.gz",
+      "entry_point": "python -u -m scripts.prepare_fineweb_to_s3",
+      "source_acquisition": "python urllib + tarfile; no git executable required",
+      "image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T19:23:12.225395+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "queued",
+      "archive_download": "pending",
+      "repository_extraction": "pending",
+      "module_startup": "pending",
+      "disk_preflight": "pending",
+      "s3_probe": "pending",
+      "dataset_load": "pending",
+      "first_uploaded_shard": null,
+      "credentials_in_returned_metadata": false
     }
   ]
 }
