@@ -103,6 +103,55 @@
       "s3_probe": "not_reached",
       "first_uploaded_shard": null,
       "platform_spend_after_failure_usd": 0.0
+    },
+    {
+      "job_id": "job-mjbqk",
+      "preparation_run_id": "fineweb10b-20260728T184548Z-57b90d",
+      "approved_git_sha": "3e018cf8b42b72d58301205619155d52319b1211",
+      "branch": "codex/gpt2-h100-training",
+      "entry_point": "python -u -m scripts.prepare_fineweb_to_s3",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T18:46:13.166217+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "queued",
+      "terminal_status": "failed",
+      "exit_code": 1,
+      "finished_at": "2026-07-28T18:47:28.402201+00:00",
+      "failure_phase": "dataset_download_and_tokenization",
+      "failure_type": "RuntimeError",
+      "failure_reason": "FineWeb streaming download repeatedly received partial parquet responses and terminated before tokenization; no shard was uploaded",
+      "git_checkout_verification": {
+        "passed": true,
+        "verified_sha": "3e018cf8b42b72d58301205619155d52319b1211"
+      },
+      "gpu_startup_check": {
+        "passed": true,
+        "visible_gpu_count": 1,
+        "model": "NVIDIA H100 80GB HBM3"
+      },
+      "disk_budget_check": {
+        "passed": true,
+        "available_gib": 80.892,
+        "required_gib": 8.159,
+        "filesystem": "overlay",
+        "mount_path": "/"
+      },
+      "s3_probe": "passed_before_dataset_download",
+      "first_uploaded_shard": null,
+      "platform_spend_after_failure_usd": 0.0,
+      "artifact": {
+        "artifact_id": "art-its4r",
+        "size_bytes": 10240,
+        "state": "ready"
+      }
     }
   ]
 }
