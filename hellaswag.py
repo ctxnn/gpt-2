@@ -40,18 +40,27 @@ DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "hellaswag")
 
 def download_file(url: str, fname: str, chunk_size=1024):
     """Helper function to download a file from a given url"""
-    resp = requests.get(url, stream=True)
-    total = int(resp.headers.get("content-length", 0))
-    with open(fname, "wb") as file, tqdm(
-        desc=fname,
-        total=total,
-        unit="iB",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
-        for data in resp.iter_content(chunk_size=chunk_size):
-            size = file.write(data)
-            bar.update(size)
+    temporary = f"{fname}.tmp"
+    try:
+        with requests.get(url, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
+            with open(temporary, "wb") as file, tqdm(
+                desc=fname,
+                total=total,
+                unit="iB",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as bar:
+                for data in resp.iter_content(chunk_size=chunk_size):
+                    size = file.write(data)
+                    bar.update(size)
+                file.flush()
+                os.fsync(file.fileno())
+        os.replace(temporary, fname)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 hellaswags = {
     "train": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_train.jsonl",
@@ -61,11 +70,12 @@ hellaswags = {
 
 enc = tiktoken.get_encoding("gpt2")
 
-def download(split):
+def download(split, data_root=None):
     """Downloads HellaSwag DATA_CACHE_DIR"""
-    os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+    cache_dir = data_root or DATA_CACHE_DIR
+    os.makedirs(cache_dir, exist_ok=True)
     data_url = hellaswags[split]
-    data_filename = os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl")
+    data_filename = os.path.join(cache_dir, f"hellaswag_{split}.jsonl")
     if not os.path.exists(data_filename):
         print(f"Downloading {data_url} to {data_filename}...")
         download_file(data_url, data_filename)
@@ -109,10 +119,18 @@ def render_example(example):
 
     return data, tokens, mask, label
 
-def iterate_examples(split):
+def iterate_examples(split, data_root=None, allow_download=True):
     # there are 10,042 examples in total in val
-    download(split)
-    with open(os.path.join(DATA_CACHE_DIR, f"hellaswag_{split}.jsonl"), "r") as f:
+    cache_dir = data_root or DATA_CACHE_DIR
+    data_filename = os.path.join(cache_dir, f"hellaswag_{split}.jsonl")
+    if not os.path.exists(data_filename):
+        if not allow_download:
+            raise FileNotFoundError(
+                f"HellaSwag split is missing: {data_filename}. "
+                "Download it before starting paid training."
+            )
+        download(split, cache_dir)
+    with open(data_filename, "r") as f:
         for line in f:
             example = json.loads(line)
             yield example
