@@ -1,0 +1,1103 @@
+#!/usr/bin/env python3
+"""Prepare FineWeb-Edu shards and upload each verified shard to S3."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import multiprocessing as mp
+import os
+import random
+import shutil
+import subprocess
+import tempfile
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+from urllib.parse import urlparse
+
+import boto3
+import numpy as np
+from boto3.s3.transfer import TransferConfig
+from botocore.config import Config
+
+from fineweb import (
+    DATASET_ID,
+    DEFAULT_DATASET_CONFIG,
+    DEFAULT_SHARD_SIZE,
+    tokenize,
+    tokenizer,
+    validate_shard_filenames,
+)
+
+LOGGER = logging.getLogger("fineweb_s3")
+TOKENIZER_NAME = "gpt2"
+SHARD_FORMAT = "NumPy .npy"
+DTYPE = np.dtype(np.uint16)
+MIN_FREE_GIB = 80
+REQUIRED_ENVIRONMENT = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ENDPOINT_URL",
+    "GMN_DATA_BUCKET",
+    "GMN_DATA_PREFIX",
+    "GIVEMEANODE_JOB_ID",
+    "GMN_OUTPUT_DIR",
+)
+SHARD_PREFIX = "shards"
+METADATA_PREFIX = "metadata"
+STATUS_PREFIX = "status"
+PROBE_PREFIX = "probes"
+PROGRESS_NAME = "progress.json"
+MANIFEST_NAME = "dataset_manifest.json"
+CHECKSUMS_NAME = "checksums.sha256"
+REPORT_NAME = "preparation_report.md"
+COMPLETE_NAME = "COMPLETE"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(frozen=True, repr=False)
+class Settings:
+    access_key_id: str
+    secret_access_key: str
+    region: str
+    default_region: str
+    endpoint_url: str
+    bucket: str
+    prefix: str
+    job_id: str
+    output_dir: Path
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str] | None = None) -> "Settings":
+        source = os.environ if environment is None else environment
+        missing = [name for name in REQUIRED_ENVIRONMENT if not source.get(name)]
+        if missing:
+            raise ValueError(
+                "missing required environment variables: " + ", ".join(sorted(missing))
+            )
+        prefix = source["GMN_DATA_PREFIX"].strip("/")
+        if not prefix:
+            raise ValueError("GMN_DATA_PREFIX must not be empty")
+        endpoint = source["AWS_ENDPOINT_URL"]
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("AWS_ENDPOINT_URL must be an HTTPS URL with a hostname")
+        return cls(
+            access_key_id=source["AWS_ACCESS_KEY_ID"],
+            secret_access_key=source["AWS_SECRET_ACCESS_KEY"],
+            region=source["AWS_REGION"],
+            default_region=source["AWS_DEFAULT_REGION"],
+            endpoint_url=endpoint,
+            bucket=source["GMN_DATA_BUCKET"],
+            prefix=prefix,
+            job_id=source["GIVEMEANODE_JOB_ID"],
+            output_dir=Path(source["GMN_OUTPUT_DIR"]),
+        )
+
+    def key(self, *parts: str) -> str:
+        suffix = "/".join(part.strip("/") for part in parts if part)
+        return f"{self.prefix}/{suffix}" if suffix else self.prefix
+
+    @property
+    def endpoint_hostname(self) -> str:
+        return urlparse(self.endpoint_url).hostname or ""
+
+
+def configure_logging() -> None:
+    logging.disable(logging.DEBUG)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
+    )
+    logging.getLogger("boto3").setLevel(logging.WARNING)
+    logging.getLogger("botocore").setLevel(logging.WARNING)
+    logging.getLogger("s3transfer").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def create_s3_client(settings: Settings):
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.endpoint_url,
+        region_name=settings.region,
+        aws_access_key_id=settings.access_key_id,
+        aws_secret_access_key=settings.secret_access_key,
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+        ),
+    )
+
+
+def git_sha() -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def require_free_disk(path: Path, minimum_gib: int = MIN_FREE_GIB) -> int:
+    path.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(path).free
+    required = minimum_gib * 1024**3
+    if free < required:
+        raise RuntimeError(
+            f"insufficient local disk: require at least {minimum_gib} GiB free"
+        )
+    return free
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    atomic_write_bytes(path, canonical_json_bytes(value))
+
+
+def atomic_write_npy(path: Path, tokens: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            np.save(handle, tokens, allow_pickle=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_and_validate_shard(
+    path: Path,
+    *,
+    shard_size: int,
+    allow_partial: bool,
+    vocabulary_size: int,
+) -> np.ndarray:
+    tokens = np.load(path, allow_pickle=False, mmap_mode="r")
+    if tokens.dtype != DTYPE:
+        raise ValueError(f"{path.name} has dtype {tokens.dtype}, expected uint16")
+    if tokens.ndim != 1 or tokens.size <= 0:
+        raise ValueError(f"{path.name} must contain a non-empty one-dimensional array")
+    if not allow_partial and tokens.size != shard_size:
+        raise ValueError(
+            f"{path.name} has {tokens.size} tokens, expected {shard_size}"
+        )
+    if tokens.size > shard_size:
+        raise ValueError(f"{path.name} exceeds configured shard size")
+    if int(tokens.max()) >= vocabulary_size:
+        raise ValueError(f"{path.name} contains a token outside the GPT-2 vocabulary")
+    return tokens
+
+
+def put_json(client: Any, settings: Settings, key: str, value: Any) -> bytes:
+    content = canonical_json_bytes(value)
+    client.put_object(
+        Bucket=settings.bucket,
+        Key=key,
+        Body=content,
+        ContentType="application/json",
+        Metadata={"sha256": sha256_bytes(content)},
+    )
+    return content
+
+
+def get_object_bytes(client: Any, settings: Settings, key: str) -> bytes:
+    response = client.get_object(Bucket=settings.bucket, Key=key)
+    body = response["Body"]
+    return body.read() if hasattr(body, "read") else bytes(body)
+
+
+def object_exists(client: Any, settings: Settings, key: str) -> bool:
+    try:
+        client.head_object(Bucket=settings.bucket, Key=key)
+    except Exception as error:
+        response = getattr(error, "response", {})
+        code = str(response.get("Error", {}).get("Code", ""))
+        status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
+            return False
+        raise
+    return True
+
+
+def list_objects(client: Any, settings: Settings, prefix: str) -> list[dict[str, Any]]:
+    objects: list[dict[str, Any]] = []
+    continuation: str | None = None
+    while True:
+        request: dict[str, Any] = {
+            "Bucket": settings.bucket,
+            "Prefix": prefix,
+        }
+        if continuation:
+            request["ContinuationToken"] = continuation
+        response = client.list_objects_v2(**request)
+        objects.extend(response.get("Contents", []))
+        if not response.get("IsTruncated"):
+            return objects
+        continuation = response["NextContinuationToken"]
+
+
+def storage_probe(client: Any, settings: Settings) -> None:
+    probe_key = settings.key(PROBE_PREFIX, settings.job_id, "probe.bin")
+    probe = os.urandom(64)
+    try:
+        client.put_object(Bucket=settings.bucket, Key=probe_key, Body=probe)
+        downloaded = get_object_bytes(client, settings, probe_key)
+        if downloaded != probe:
+            raise RuntimeError("S3 probe byte verification failed")
+    finally:
+        try:
+            client.delete_object(Bucket=settings.bucket, Key=probe_key)
+        except Exception:
+            LOGGER.warning("S3 probe cleanup did not complete")
+
+
+def parse_remote_shard_name(name: str) -> tuple[str, int]:
+    path = Path(name)
+    parts = path.name.removesuffix(".npy").split("_")
+    if (
+        len(parts) != 3
+        or parts[0] != "edufineweb"
+        or parts[1] not in {"train", "val"}
+        or len(parts[2]) != 6
+        or not parts[2].isdigit()
+        or path.suffix != ".npy"
+    ):
+        raise ValueError(f"malformed or unexpected remote shard filename: {path.name}")
+    return parts[1], int(parts[2])
+
+
+def load_progress(client: Any, settings: Settings) -> dict[str, Any]:
+    key = settings.key(METADATA_PREFIX, PROGRESS_NAME)
+    if not object_exists(client, settings, key):
+        return {
+            "schema_version": 1,
+            "source_dataset": DATASET_ID,
+            "dataset_configuration": DEFAULT_DATASET_CONFIG,
+            "shard_size": DEFAULT_SHARD_SIZE,
+            "updated_at": utc_now(),
+            "complete": False,
+            "shards": [],
+        }
+    return json.loads(get_object_bytes(client, settings, key))
+
+
+def progress_by_filename(progress: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        item["filename"]: dict(item)
+        for item in progress.get("shards", [])
+        if isinstance(item, Mapping) and isinstance(item.get("filename"), str)
+    }
+
+
+def progress_record_matches_head(
+    record: Mapping[str, Any] | None,
+    *,
+    split: str,
+    index: int,
+    key: str,
+    remote_bytes: int,
+    metadata: Mapping[str, str],
+    shard_size: int,
+) -> bool:
+    if record is None:
+        return False
+    try:
+        token_count = int(record.get("token_count", 0))
+        expected_sha = str(record.get("sha256", ""))
+        return (
+            record.get("split") == split
+            and int(record.get("index", -1)) == index
+            and record.get("remote_key") == key
+            and 0 < token_count <= shard_size
+            and int(record.get("local_bytes", -1)) == remote_bytes
+            and int(record.get("remote_bytes", -1)) == remote_bytes
+            and bool(expected_sha)
+            and metadata.get("sha256") == expected_sha
+            and metadata.get("token-count") == str(token_count)
+            and metadata.get("split") == split
+            and metadata.get("shard-index") == str(index)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def upload_progress(
+    client: Any,
+    settings: Settings,
+    progress: dict[str, Any],
+) -> None:
+    progress["updated_at"] = utc_now()
+    progress["shards"] = sorted(
+        progress["shards"], key=lambda item: int(item["index"])
+    )
+    put_json(
+        client,
+        settings,
+        settings.key(METADATA_PREFIX, PROGRESS_NAME),
+        progress,
+    )
+
+
+def inspect_downloaded_shard(
+    client: Any,
+    settings: Settings,
+    key: str,
+    destination: Path,
+    *,
+    shard_size: int,
+    allow_partial: bool,
+    vocabulary_size: int,
+) -> tuple[int, int, str]:
+    client.download_file(settings.bucket, key, str(destination))
+    tokens = load_and_validate_shard(
+        destination,
+        shard_size=shard_size,
+        allow_partial=allow_partial,
+        vocabulary_size=vocabulary_size,
+    )
+    return int(tokens.size), destination.stat().st_size, sha256_file(destination)
+
+
+def verify_existing_shards(
+    client: Any,
+    settings: Settings,
+    progress: dict[str, Any],
+    work_dir: Path,
+    *,
+    shard_size: int,
+    vocabulary_size: int,
+) -> dict[str, dict[str, Any]]:
+    records = progress_by_filename(progress)
+    verified: dict[str, dict[str, Any]] = {}
+    remote_objects = list_objects(client, settings, settings.key(SHARD_PREFIX) + "/")
+    seen_indices: set[tuple[str, int]] = set()
+    for remote in remote_objects:
+        key = remote["Key"]
+        filename = Path(key).name
+        split, index = parse_remote_shard_name(filename)
+        identity = (split, index)
+        if identity in seen_indices:
+            raise ValueError(f"duplicate remote shard identity: {split} {index}")
+        seen_indices.add(identity)
+        record = records.get(filename)
+        head = client.head_object(Bucket=settings.bucket, Key=key)
+        remote_bytes = int(head["ContentLength"])
+        metadata = {
+            str(k).lower(): str(v) for k, v in head.get("Metadata", {}).items()
+        }
+        expected_sha = str(record.get("sha256", "")) if record else ""
+        if progress_record_matches_head(
+            record,
+            split=split,
+            index=index,
+            key=key,
+            remote_bytes=remote_bytes,
+            metadata=metadata,
+            shard_size=shard_size,
+        ):
+            verified[filename] = record
+            continue
+
+        local = work_dir / f"inspect-{filename}"
+        try:
+            token_count, local_bytes, actual_sha = inspect_downloaded_shard(
+                client,
+                settings,
+                key,
+                local,
+                shard_size=shard_size,
+                allow_partial=True,
+                vocabulary_size=vocabulary_size,
+            )
+            if expected_sha and actual_sha != expected_sha:
+                continue
+            verified[filename] = {
+                "filename": filename,
+                "split": split,
+                "index": index,
+                "token_count": token_count,
+                "local_bytes": local_bytes,
+                "remote_bytes": remote_bytes,
+                "sha256": actual_sha,
+                "etag": str(head.get("ETag", "")).strip('"'),
+                "remote_key": key,
+                "upload_timestamp": record.get("upload_timestamp", utc_now())
+                if record
+                else utc_now(),
+            }
+        except (OSError, ValueError):
+            continue
+        finally:
+            local.unlink(missing_ok=True)
+    progress["shards"] = list(verified.values())
+    return verified
+
+
+def upload_verified_shard(
+    client: Any,
+    settings: Settings,
+    path: Path,
+    *,
+    split: str,
+    index: int,
+    shard_size: int,
+    allow_partial: bool,
+    vocabulary_size: int,
+) -> dict[str, Any]:
+    tokens = load_and_validate_shard(
+        path,
+        shard_size=shard_size,
+        allow_partial=allow_partial,
+        vocabulary_size=vocabulary_size,
+    )
+    digest = sha256_file(path)
+    local_bytes = path.stat().st_size
+    key = settings.key(SHARD_PREFIX, path.name)
+    client.upload_file(
+        str(path),
+        settings.bucket,
+        key,
+        ExtraArgs={
+            "Metadata": {
+                "sha256": digest,
+                "token-count": str(int(tokens.size)),
+                "split": split,
+                "shard-index": str(index),
+            }
+        },
+        Config=TransferConfig(),
+    )
+    head = client.head_object(Bucket=settings.bucket, Key=key)
+    remote_bytes = int(head["ContentLength"])
+    if remote_bytes != local_bytes:
+        raise RuntimeError(
+            f"remote size mismatch for {path.name}: {remote_bytes} != {local_bytes}"
+        )
+    metadata = {str(k).lower(): str(v) for k, v in head.get("Metadata", {}).items()}
+    if metadata.get("sha256") != digest:
+        raise RuntimeError(f"remote SHA-256 metadata mismatch for {path.name}")
+    return {
+        "filename": path.name,
+        "split": split,
+        "index": index,
+        "token_count": int(tokens.size),
+        "local_bytes": local_bytes,
+        "remote_bytes": remote_bytes,
+        "sha256": digest,
+        "etag": str(head.get("ETag", "")).strip('"'),
+        "remote_key": key,
+        "upload_timestamp": utc_now(),
+    }
+
+
+def replace_progress_record(progress: dict[str, Any], record: Mapping[str, Any]) -> None:
+    progress["shards"] = [
+        item
+        for item in progress["shards"]
+        if item.get("filename") != record["filename"]
+    ]
+    progress["shards"].append(dict(record))
+
+
+@contextmanager
+def tokenized_documents(
+    dataset: Iterable[dict[str, Any]],
+    workers: int | None = None,
+) -> Iterator[Iterable[np.ndarray]]:
+    worker_count = workers or max(1, os.cpu_count() or 1)
+    with mp.Pool(worker_count) as pool:
+        yield pool.imap(tokenize, dataset, chunksize=16)
+
+
+def load_source_dataset() -> Iterable[dict[str, Any]]:
+    from datasets import load_dataset
+
+    return load_dataset(
+        DATASET_ID,
+        name=DEFAULT_DATASET_CONFIG,
+        split="train",
+        cache_dir=os.environ.get("HF_DATASETS_CACHE"),
+    )
+
+
+def create_and_upload_shards(
+    client: Any,
+    settings: Settings,
+    progress: dict[str, Any],
+    verified: Mapping[str, Mapping[str, Any]],
+    work_dir: Path,
+    *,
+    dataset: Iterable[dict[str, Any]],
+    token_stream_factory: Callable[
+        [Iterable[dict[str, Any]]], Any
+    ] = tokenized_documents,
+    shard_size: int = DEFAULT_SHARD_SIZE,
+    vocabulary_size: int,
+) -> list[dict[str, Any]]:
+    buffer = np.empty((shard_size,), dtype=DTYPE)
+    shard_index = 0
+    token_count = 0
+
+    def finish_shard(tokens: np.ndarray, *, final_partial: bool) -> None:
+        nonlocal shard_index
+        split = "val" if shard_index == 0 else "train"
+        filename = f"edufineweb_{split}_{shard_index:06d}.npy"
+        existing = verified.get(filename)
+        if existing and int(existing["token_count"]) == int(tokens.size):
+            replace_progress_record(progress, existing)
+            upload_progress(client, settings, progress)
+            shard_index += 1
+            return
+        destination = work_dir / filename
+        try:
+            atomic_write_npy(destination, tokens)
+            record = upload_verified_shard(
+                client,
+                settings,
+                destination,
+                split=split,
+                index=shard_index,
+                shard_size=shard_size,
+                allow_partial=final_partial,
+                vocabulary_size=vocabulary_size,
+            )
+            replace_progress_record(progress, record)
+            upload_progress(client, settings, progress)
+        finally:
+            destination.unlink(missing_ok=True)
+        shard_index += 1
+
+    with token_stream_factory(dataset) as tokenized_stream:
+        for tokens in tokenized_stream:
+            consumed = 0
+            while consumed < len(tokens):
+                amount = min(shard_size - token_count, len(tokens) - consumed)
+                buffer[token_count : token_count + amount] = tokens[
+                    consumed : consumed + amount
+                ]
+                token_count += amount
+                consumed += amount
+                if token_count == shard_size:
+                    finish_shard(buffer, final_partial=False)
+                    token_count = 0
+        if token_count:
+            finish_shard(buffer[:token_count].copy(), final_partial=True)
+    return sorted(progress["shards"], key=lambda item: int(item["index"]))
+
+
+def verify_manifest_reference(
+    client: Any,
+    settings: Settings,
+    marker: Mapping[str, Any],
+) -> bool:
+    manifest_key = marker.get("manifest_path")
+    expected_sha = marker.get("manifest_sha256")
+    if not isinstance(manifest_key, str) or not isinstance(expected_sha, str):
+        return False
+    try:
+        content = get_object_bytes(client, settings, manifest_key)
+        if sha256_bytes(content) != expected_sha:
+            return False
+        manifest = json.loads(content)
+        if manifest.get("git_sha") != marker.get("git_sha"):
+            return False
+        if manifest.get("shard_count") != marker.get("shard_count"):
+            return False
+        for shard in manifest.get("shards", []):
+            head = client.head_object(
+                Bucket=settings.bucket,
+                Key=shard["remote_key"],
+            )
+            metadata = {
+                str(k).lower(): str(v)
+                for k, v in head.get("Metadata", {}).items()
+            }
+            if int(head["ContentLength"]) != int(shard["remote_bytes"]):
+                return False
+            if metadata.get("sha256") != shard["sha256"]:
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def already_complete(client: Any, settings: Settings) -> bool:
+    key = settings.key(STATUS_PREFIX, COMPLETE_NAME)
+    if not object_exists(client, settings, key):
+        return False
+    try:
+        marker = json.loads(get_object_bytes(client, settings, key))
+    except Exception:
+        return False
+    return verify_manifest_reference(client, settings, marker)
+
+
+def sample_indices(count: int) -> list[int]:
+    candidates = {0, 1, count - 1, count // 2}
+    return sorted(index for index in candidates if 0 <= index < count)
+
+
+def verify_random_batch(paths: Sequence[Path]) -> dict[str, int]:
+    arrays = [np.load(path, allow_pickle=False, mmap_mode="r") for path in paths]
+    available = [array for array in arrays if array.size >= 2]
+    if not available:
+        raise ValueError("no shard has enough tokens to form a training batch")
+    random_source = random.Random(0)
+    array = random_source.choice(available)
+    sequence_length = min(32, int(array.size) - 1)
+    batch_size = min(4, max(1, (int(array.size) - 1) // sequence_length))
+    starts = [
+        random_source.randrange(0, int(array.size) - sequence_length)
+        for _ in range(batch_size)
+    ]
+    inputs = np.stack([array[start : start + sequence_length] for start in starts])
+    targets = np.stack(
+        [array[start + 1 : start + sequence_length + 1] for start in starts]
+    )
+    if inputs.shape != targets.shape or inputs.size == 0:
+        raise ValueError("representative random batch verification failed")
+    return {"batch_size": batch_size, "sequence_length": sequence_length}
+
+
+def final_validation(
+    client: Any,
+    settings: Settings,
+    records: Sequence[Mapping[str, Any]],
+    work_dir: Path,
+    *,
+    shard_size: int,
+    vocabulary_size: int,
+) -> dict[str, Any]:
+    ordered = validate_shard_filenames(
+        [Path(str(record["filename"])) for record in records]
+    )
+    records_by_name = {str(record["filename"]): record for record in records}
+    if len(records_by_name) != len(records):
+        raise ValueError("duplicate shard filename in progress metadata")
+    remote = list_objects(client, settings, settings.key(SHARD_PREFIX) + "/")
+    remote_names: set[str] = set()
+    for item in remote:
+        remote_name = Path(item["Key"]).name
+        if item["Key"] != settings.key(SHARD_PREFIX, remote_name):
+            raise ValueError(f"unexpected remote shard key: {item['Key']}")
+        if remote_name in remote_names:
+            raise ValueError(f"duplicate remote shard filename: {remote_name}")
+        remote_names.add(remote_name)
+    expected_names = set(records_by_name)
+    if remote_names != expected_names:
+        raise ValueError("remote shard listing differs from verified progress metadata")
+
+    for position, shard in enumerate(ordered):
+        record = records_by_name[shard.path.name]
+        head = client.head_object(
+            Bucket=settings.bucket,
+            Key=str(record["remote_key"]),
+        )
+        metadata = {
+            str(k).lower(): str(v) for k, v in head.get("Metadata", {}).items()
+        }
+        if int(head["ContentLength"]) != int(record["remote_bytes"]):
+            raise ValueError(f"remote size mismatch for {shard.path.name}")
+        if metadata.get("sha256") != record["sha256"]:
+            raise ValueError(f"remote SHA-256 mismatch for {shard.path.name}")
+        expected_count = int(record["token_count"])
+        if position < len(ordered) - 1 and expected_count != shard_size:
+            raise ValueError(f"non-final shard is partial: {shard.path.name}")
+        if position == len(ordered) - 1 and expected_count > shard_size:
+            raise ValueError(f"final shard exceeds shard size: {shard.path.name}")
+
+    sampled_paths: list[Path] = []
+    sampled_names: list[str] = []
+    for index in sample_indices(len(ordered)):
+        shard = ordered[index]
+        record = records_by_name[shard.path.name]
+        destination = work_dir / f"sample-{shard.path.name}"
+        token_count, local_bytes, actual_sha = inspect_downloaded_shard(
+            client,
+            settings,
+            str(record["remote_key"]),
+            destination,
+            shard_size=shard_size,
+            allow_partial=index == len(ordered) - 1,
+            vocabulary_size=vocabulary_size,
+        )
+        if token_count != int(record["token_count"]):
+            raise ValueError(f"sample token count mismatch for {shard.path.name}")
+        if local_bytes != int(record["remote_bytes"]):
+            raise ValueError(f"sample byte count mismatch for {shard.path.name}")
+        if actual_sha != record["sha256"]:
+            raise ValueError(f"sample SHA-256 mismatch for {shard.path.name}")
+        sampled_paths.append(destination)
+        sampled_names.append(shard.path.name)
+    batch = verify_random_batch(sampled_paths)
+    for path in sampled_paths:
+        path.unlink(missing_ok=True)
+
+    val_count = sum(1 for shard in ordered if shard.split == "val")
+    train_count = sum(1 for shard in ordered if shard.split == "train")
+    return {
+        "numeric_filename_validation": True,
+        "exactly_one_validation_shard": val_count == 1,
+        "validation_index_zero": ordered[0].split == "val"
+        and ordered[0].index == 0,
+        "training_indices_contiguous": True,
+        "unexpected_remote_files_absent": True,
+        "all_remote_sizes_match": True,
+        "all_recorded_sha256_match": True,
+        "sampled_shards": sampled_names,
+        "sampled_shards_readable_uint16": True,
+        "token_ids_within_gpt2_vocabulary": True,
+        "representative_random_batch": batch,
+        "validation_shard_count": val_count,
+        "training_shard_count": train_count,
+    }
+
+
+def build_manifest(
+    settings: Settings,
+    records: Sequence[Mapping[str, Any]],
+    validation: Mapping[str, Any],
+    *,
+    preparation_git_sha: str,
+    shard_size: int,
+) -> dict[str, Any]:
+    ordered = sorted(records, key=lambda item: int(item["index"]))
+    return {
+        "schema_version": 1,
+        "source_dataset": DATASET_ID,
+        "dataset_configuration": DEFAULT_DATASET_CONFIG,
+        "tokenizer": TOKENIZER_NAME,
+        "shard_format": SHARD_FORMAT,
+        "dtype": "uint16",
+        "shard_size": shard_size,
+        "git_sha": preparation_git_sha,
+        "givemeanode_job_id": settings.job_id,
+        "preparation_command": "python scripts/prepare_fineweb_to_s3.py",
+        "preparation_timestamp": utc_now(),
+        "bucket": settings.bucket,
+        "prefix": settings.prefix,
+        "shard_count": len(ordered),
+        "training_shard_count": sum(
+            1 for item in ordered if item["split"] == "train"
+        ),
+        "validation_shard_count": sum(
+            1 for item in ordered if item["split"] == "val"
+        ),
+        "total_token_count": sum(int(item["token_count"]) for item in ordered),
+        "total_bytes": sum(int(item["remote_bytes"]) for item in ordered),
+        "shards": ordered,
+        "validation": dict(validation),
+    }
+
+
+def build_report(
+    manifest: Mapping[str, Any] | None,
+    *,
+    complete: bool,
+    failure_type: str | None = None,
+) -> str:
+    status = "complete" if complete else "incomplete"
+    lines = [
+        "# FineWeb-Edu S3 preparation report",
+        "",
+        f"- Status: {status}",
+        f"- Generated: {utc_now()}",
+    ]
+    if manifest:
+        lines.extend(
+            [
+                f"- Git SHA: {manifest['git_sha']}",
+                f"- Job ID: {manifest['givemeanode_job_id']}",
+                f"- Bucket: {manifest['bucket']}",
+                f"- Prefix: {manifest['prefix']}",
+                f"- Shards: {manifest['shard_count']}",
+                f"- Tokens: {manifest['total_token_count']}",
+                f"- Bytes: {manifest['total_bytes']}",
+            ]
+        )
+    if failure_type:
+        lines.append(f"- Failure type: {failure_type}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def upload_text(
+    client: Any,
+    settings: Settings,
+    key: str,
+    content: str,
+    *,
+    content_type: str,
+) -> bytes:
+    encoded = content.encode("utf-8")
+    client.put_object(
+        Bucket=settings.bucket,
+        Key=key,
+        Body=encoded,
+        ContentType=content_type,
+        Metadata={"sha256": sha256_bytes(encoded)},
+    )
+    return encoded
+
+
+def write_small_output(settings: Settings, value: Mapping[str, Any]) -> None:
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(settings.output_dir / "dataset_preparation_result.json", value)
+
+
+def publish_final_metadata(
+    client: Any,
+    settings: Settings,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    manifest_key = settings.key(METADATA_PREFIX, MANIFEST_NAME)
+    manifest_bytes = put_json(client, settings, manifest_key, manifest)
+    manifest_sha = sha256_bytes(manifest_bytes)
+    checksums = "".join(
+        f"{item['sha256']}  {item['filename']}\n" for item in manifest["shards"]
+    )
+    checksums_key = settings.key(METADATA_PREFIX, CHECKSUMS_NAME)
+    upload_text(
+        client,
+        settings,
+        checksums_key,
+        checksums,
+        content_type="text/plain",
+    )
+    report_key = settings.key(METADATA_PREFIX, REPORT_NAME)
+    report = build_report(manifest, complete=True)
+    upload_text(
+        client,
+        settings,
+        report_key,
+        report,
+        content_type="text/markdown",
+    )
+    marker = {
+        "manifest_path": manifest_key,
+        "manifest_sha256": manifest_sha,
+        "completion_timestamp": utc_now(),
+        "git_sha": manifest["git_sha"],
+        "job_id": settings.job_id,
+        "shard_count": manifest["shard_count"],
+        "total_token_count": manifest["total_token_count"],
+        "total_bytes": manifest["total_bytes"],
+    }
+    put_json(
+        client,
+        settings,
+        settings.key(STATUS_PREFIX, COMPLETE_NAME),
+        marker,
+    )
+    return marker
+
+
+def run(
+    settings: Settings,
+    *,
+    client: Any | None = None,
+    dataset_loader: Callable[[], Iterable[dict[str, Any]]] = load_source_dataset,
+    token_stream_factory: Callable[
+        [Iterable[dict[str, Any]]], Any
+    ] = tokenized_documents,
+    shard_size: int = DEFAULT_SHARD_SIZE,
+    minimum_free_gib: int = MIN_FREE_GIB,
+) -> dict[str, Any]:
+    active_client = client or create_s3_client(settings)
+    current_sha = git_sha()
+    LOGGER.info(
+        "configuration bucket=%s prefix=%s endpoint=%s region=%s job_id=%s git_sha=%s",
+        settings.bucket,
+        settings.prefix,
+        settings.endpoint_hostname,
+        settings.region,
+        settings.job_id,
+        current_sha,
+    )
+
+    temp_root = Path(tempfile.gettempdir()) / f"fineweb-s3-{settings.job_id}"
+    require_free_disk(temp_root, minimum_free_gib)
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+
+    if already_complete(active_client, settings):
+        result = {
+            "status": "already_complete",
+            "bucket": settings.bucket,
+            "prefix": settings.prefix,
+            "git_sha": current_sha,
+            "job_id": settings.job_id,
+        }
+        write_small_output(settings, result)
+        LOGGER.info("verified COMPLETE marker; no dataset preparation required")
+        return result
+
+    storage_probe(active_client, settings)
+    hf_cache = temp_root / "hf-cache"
+    os.environ["HF_HOME"] = str(hf_cache)
+    os.environ["HF_DATASETS_CACHE"] = str(hf_cache / "datasets")
+    vocabulary_size = tokenizer().n_vocab
+    progress = load_progress(active_client, settings)
+    progress.update(
+        {
+            "source_dataset": DATASET_ID,
+            "dataset_configuration": DEFAULT_DATASET_CONFIG,
+            "shard_size": shard_size,
+            "git_sha": current_sha,
+            "job_id": settings.job_id,
+            "complete": False,
+        }
+    )
+    manifest: dict[str, Any] | None = None
+    try:
+        verified = verify_existing_shards(
+            active_client,
+            settings,
+            progress,
+            temp_root,
+            shard_size=shard_size,
+            vocabulary_size=vocabulary_size,
+        )
+        upload_progress(active_client, settings, progress)
+        dataset = dataset_loader()
+        records = create_and_upload_shards(
+            active_client,
+            settings,
+            progress,
+            verified,
+            temp_root,
+            dataset=dataset,
+            token_stream_factory=token_stream_factory,
+            shard_size=shard_size,
+            vocabulary_size=vocabulary_size,
+        )
+        validation = final_validation(
+            active_client,
+            settings,
+            records,
+            temp_root,
+            shard_size=shard_size,
+            vocabulary_size=vocabulary_size,
+        )
+        manifest = build_manifest(
+            settings,
+            records,
+            validation,
+            preparation_git_sha=current_sha,
+            shard_size=shard_size,
+        )
+        progress["complete"] = True
+        upload_progress(active_client, settings, progress)
+        marker = publish_final_metadata(active_client, settings, manifest)
+        if not verify_manifest_reference(active_client, settings, marker):
+            active_client.delete_object(
+                Bucket=settings.bucket,
+                Key=settings.key(STATUS_PREFIX, COMPLETE_NAME),
+            )
+            raise RuntimeError("post-publication COMPLETE verification failed")
+        result = {
+            "status": "complete",
+            "bucket": settings.bucket,
+            "prefix": settings.prefix,
+            "manifest_path": marker["manifest_path"],
+            "manifest_sha256": marker["manifest_sha256"],
+            "shard_count": marker["shard_count"],
+            "total_token_count": marker["total_token_count"],
+            "total_bytes": marker["total_bytes"],
+            "git_sha": current_sha,
+            "job_id": settings.job_id,
+        }
+        try:
+            write_small_output(settings, result)
+        except OSError:
+            LOGGER.warning("could not write the small local result pointer")
+        return result
+    except Exception as error:
+        progress["complete"] = False
+        try:
+            upload_progress(active_client, settings, progress)
+            upload_text(
+                active_client,
+                settings,
+                settings.key(METADATA_PREFIX, REPORT_NAME),
+                build_report(
+                    manifest,
+                    complete=False,
+                    failure_type=type(error).__name__,
+                ),
+                content_type="text/markdown",
+            )
+        except Exception:
+            LOGGER.error("failed to publish incomplete progress metadata")
+        write_small_output(
+            settings,
+            {
+                "status": "incomplete",
+                "bucket": settings.bucket,
+                "prefix": settings.prefix,
+                "git_sha": current_sha,
+                "job_id": settings.job_id,
+                "failure_type": type(error).__name__,
+            },
+        )
+        LOGGER.error("dataset preparation failed (%s)", type(error).__name__)
+        raise
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def main() -> int:
+    configure_logging()
+    settings: Settings | None = None
+    try:
+        settings = Settings.from_environment()
+        run(settings)
+        return 0
+    except Exception as error:
+        if settings is None:
+            LOGGER.error("startup validation failed (%s)", type(error).__name__)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
