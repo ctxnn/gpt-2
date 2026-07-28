@@ -136,8 +136,9 @@ def environment(tmp_path: Path) -> dict[str, str]:
         "AWS_ENDPOINT_URL": "https://storage.example.invalid",
         "GMN_DATA_BUCKET": "test-bucket",
         "GMN_DATA_PREFIX": "v1",
-        "GIVEMEANODE_JOB_ID": "job-test",
+        "GMN_PREPARATION_RUN_ID": "prep-test",
         "GMN_OUTPUT_DIR": str(tmp_path / "output"),
+        "GMN_RESULT_PATH": str(tmp_path / "result.json"),
     }
 
 
@@ -188,6 +189,40 @@ def test_required_variable_validation(environment: dict[str, str]) -> None:
         ValueError, match="missing required environment variables: AWS_SECRET_ACCESS_KEY"
     ):
         Settings.from_environment(environment)
+
+
+def test_missing_optional_job_id_is_null(environment: dict[str, str]) -> None:
+    configured = Settings.from_environment(environment)
+    assert configured.job_id is None
+
+
+def test_injected_job_id_is_recorded(environment: dict[str, str]) -> None:
+    environment["GIVEMEANODE_JOB_ID"] = "job-authoritative"
+    configured = Settings.from_environment(environment)
+    assert configured.job_id == "job-authoritative"
+
+
+@pytest.mark.parametrize("value", ["", "null", "none", "NULL"])
+def test_empty_or_null_job_id_is_optional(
+    environment: dict[str, str],
+    value: str,
+) -> None:
+    environment["GIVEMEANODE_JOB_ID"] = value
+    configured = Settings.from_environment(environment)
+    assert configured.job_id is None
+
+
+def test_generated_preparation_run_id(environment: dict[str, str]) -> None:
+    del environment["GMN_PREPARATION_RUN_ID"]
+    configured = Settings.from_environment(environment)
+    assert configured.preparation_run_id.startswith("prep-")
+    assert len(configured.preparation_run_id) == 37
+
+
+def test_supplied_preparation_run_id(environment: dict[str, str]) -> None:
+    environment["GMN_PREPARATION_RUN_ID"] = "fineweb-run-20260728"
+    configured = Settings.from_environment(environment)
+    assert configured.preparation_run_id == "fineweb-run-20260728"
 
 
 def test_credentials_never_appear_in_logs(
@@ -466,6 +501,8 @@ def test_manifest_generation(settings: Settings) -> None:
         records,
         {"numeric_filename_validation": True},
         preparation_git_sha="a" * 40,
+        preparation_started_at="2026-07-28T00:00:00+00:00",
+        preparation_finished_at="2026-07-28T01:00:00+00:00",
         shard_size=4,
     )
     assert manifest["source_dataset"] == "HuggingFaceFW/fineweb-edu"
@@ -474,6 +511,8 @@ def test_manifest_generation(settings: Settings) -> None:
     assert manifest["total_token_count"] == 7
     assert manifest["training_shard_count"] == 1
     assert manifest["validation_shard_count"] == 1
+    assert manifest["preparation_run_id"] == "prep-test"
+    assert manifest["givemeanode_job_id"] is None
 
 
 def test_numeric_shard_validation_is_used() -> None:
@@ -508,6 +547,16 @@ def test_complete_written_only_after_full_success(
     assert already_complete(client, settings)
     assert marker["shard_count"] == 3
     assert marker["total_token_count"] == 9
+    assert marker["preparation_run_id"] == "prep-test"
+    assert marker["givemeanode_job_id"] is None
+    assert (
+        settings.bucket,
+        settings.key("runs", "prep-test", "startup.json"),
+    ) in client.objects
+    assert (
+        settings.bucket,
+        settings.key("runs", "prep-test", "final_status.json"),
+    ) in client.objects
 
 
 def test_complete_absent_on_failure(settings: Settings) -> None:

@@ -9,9 +9,11 @@ import logging
 import multiprocessing as mp
 import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -46,8 +48,6 @@ REQUIRED_ENVIRONMENT = (
     "AWS_ENDPOINT_URL",
     "GMN_DATA_BUCKET",
     "GMN_DATA_PREFIX",
-    "GIVEMEANODE_JOB_ID",
-    "GMN_OUTPUT_DIR",
 )
 SHARD_PREFIX = "shards"
 METADATA_PREFIX = "metadata"
@@ -58,6 +58,7 @@ MANIFEST_NAME = "dataset_manifest.json"
 CHECKSUMS_NAME = "checksums.sha256"
 REPORT_NAME = "preparation_report.md"
 COMPLETE_NAME = "COMPLETE"
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def utc_now() -> str:
@@ -73,8 +74,10 @@ class Settings:
     endpoint_url: str
     bucket: str
     prefix: str
-    job_id: str
-    output_dir: Path
+    preparation_run_id: str
+    job_id: str | None
+    output_dir: Path | None
+    result_path: Path | None
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> "Settings":
@@ -87,6 +90,12 @@ class Settings:
         prefix = source["GMN_DATA_PREFIX"].strip("/")
         if not prefix:
             raise ValueError("GMN_DATA_PREFIX must not be empty")
+        supplied_run_id = source.get("GMN_PREPARATION_RUN_ID", "").strip()
+        preparation_run_id = supplied_run_id or f"prep-{uuid.uuid4().hex}"
+        if RUN_ID_PATTERN.fullmatch(preparation_run_id) is None:
+            raise ValueError("GMN_PREPARATION_RUN_ID contains unsafe characters")
+        raw_job_id = source.get("GIVEMEANODE_JOB_ID", "").strip()
+        job_id = None if raw_job_id.lower() in {"", "null", "none"} else raw_job_id
         endpoint = source["AWS_ENDPOINT_URL"]
         parsed = urlparse(endpoint)
         if parsed.scheme != "https" or not parsed.hostname:
@@ -99,8 +108,14 @@ class Settings:
             endpoint_url=endpoint,
             bucket=source["GMN_DATA_BUCKET"],
             prefix=prefix,
-            job_id=source["GIVEMEANODE_JOB_ID"],
-            output_dir=Path(source["GMN_OUTPUT_DIR"]),
+            preparation_run_id=preparation_run_id,
+            job_id=job_id,
+            output_dir=Path(source["GMN_OUTPUT_DIR"])
+            if source.get("GMN_OUTPUT_DIR")
+            else None,
+            result_path=Path(source["GMN_RESULT_PATH"])
+            if source.get("GMN_RESULT_PATH")
+            else None,
         )
 
     def key(self, *parts: str) -> str:
@@ -278,7 +293,11 @@ def list_objects(client: Any, settings: Settings, prefix: str) -> list[dict[str,
 
 
 def storage_probe(client: Any, settings: Settings) -> None:
-    probe_key = settings.key(PROBE_PREFIX, settings.job_id, "probe.bin")
+    probe_key = settings.key(
+        PROBE_PREFIX,
+        settings.preparation_run_id,
+        "probe.bin",
+    )
     probe = os.urandom(64)
     try:
         client.put_object(Bucket=settings.bucket, Key=probe_key, Body=probe)
@@ -800,6 +819,8 @@ def build_manifest(
     validation: Mapping[str, Any],
     *,
     preparation_git_sha: str,
+    preparation_started_at: str,
+    preparation_finished_at: str,
     shard_size: int,
 ) -> dict[str, Any]:
     ordered = sorted(records, key=lambda item: int(item["index"]))
@@ -812,9 +833,11 @@ def build_manifest(
         "dtype": "uint16",
         "shard_size": shard_size,
         "git_sha": preparation_git_sha,
+        "preparation_run_id": settings.preparation_run_id,
         "givemeanode_job_id": settings.job_id,
         "preparation_command": "python scripts/prepare_fineweb_to_s3.py",
-        "preparation_timestamp": utc_now(),
+        "preparation_started_at": preparation_started_at,
+        "preparation_finished_at": preparation_finished_at,
         "bucket": settings.bucket,
         "prefix": settings.prefix,
         "shard_count": len(ordered),
@@ -848,6 +871,7 @@ def build_report(
         lines.extend(
             [
                 f"- Git SHA: {manifest['git_sha']}",
+                f"- Preparation run ID: {manifest['preparation_run_id']}",
                 f"- Job ID: {manifest['givemeanode_job_id']}",
                 f"- Bucket: {manifest['bucket']}",
                 f"- Prefix: {manifest['prefix']}",
@@ -882,8 +906,14 @@ def upload_text(
 
 
 def write_small_output(settings: Settings, value: Mapping[str, Any]) -> None:
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(settings.output_dir / "dataset_preparation_result.json", value)
+    if settings.output_dir is not None:
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(
+            settings.output_dir / "dataset_preparation_result.json",
+            value,
+        )
+    if settings.result_path is not None:
+        atomic_write_json(settings.result_path, value)
 
 
 def publish_final_metadata(
@@ -914,12 +944,35 @@ def publish_final_metadata(
         report,
         content_type="text/markdown",
     )
+    final_status = {
+        "status": "complete",
+        "preparation_run_id": settings.preparation_run_id,
+        "givemeanode_job_id": settings.job_id,
+        "git_sha": manifest["git_sha"],
+        "finished_at": manifest["preparation_finished_at"],
+        "shard_count": manifest["shard_count"],
+        "total_token_count": manifest["total_token_count"],
+        "total_bytes": manifest["total_bytes"],
+        "manifest_path": manifest_key,
+        "manifest_sha256": manifest_sha,
+    }
+    put_json(
+        client,
+        settings,
+        settings.key(
+            "runs",
+            settings.preparation_run_id,
+            "final_status.json",
+        ),
+        final_status,
+    )
     marker = {
         "manifest_path": manifest_key,
         "manifest_sha256": manifest_sha,
         "completion_timestamp": utc_now(),
         "git_sha": manifest["git_sha"],
-        "job_id": settings.job_id,
+        "preparation_run_id": settings.preparation_run_id,
+        "givemeanode_job_id": settings.job_id,
         "shard_count": manifest["shard_count"],
         "total_token_count": manifest["total_token_count"],
         "total_bytes": manifest["total_bytes"],
@@ -946,50 +999,111 @@ def run(
 ) -> dict[str, Any]:
     active_client = client or create_s3_client(settings)
     current_sha = git_sha()
+    started_at = utc_now()
     LOGGER.info(
-        "configuration bucket=%s prefix=%s endpoint=%s region=%s job_id=%s git_sha=%s",
+        "configuration bucket=%s prefix=%s endpoint=%s region=%s "
+        "preparation_run_id=%s job_id=%s git_sha=%s",
         settings.bucket,
         settings.prefix,
         settings.endpoint_hostname,
         settings.region,
+        settings.preparation_run_id,
         settings.job_id,
         current_sha,
     )
 
-    temp_root = Path(tempfile.gettempdir()) / f"fineweb-s3-{settings.job_id}"
-    require_free_disk(temp_root, minimum_free_gib)
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
-
-    if already_complete(active_client, settings):
-        result = {
-            "status": "already_complete",
-            "bucket": settings.bucket,
-            "prefix": settings.prefix,
-            "git_sha": current_sha,
-            "job_id": settings.job_id,
-        }
-        write_small_output(settings, result)
-        LOGGER.info("verified COMPLETE marker; no dataset preparation required")
-        return result
-
-    storage_probe(active_client, settings)
-    hf_cache = temp_root / "hf-cache"
-    os.environ["HF_HOME"] = str(hf_cache)
-    os.environ["HF_DATASETS_CACHE"] = str(hf_cache / "datasets")
-    vocabulary_size = tokenizer().n_vocab
-    progress = load_progress(active_client, settings)
-    progress.update(
-        {
-            "source_dataset": DATASET_ID,
-            "dataset_configuration": DEFAULT_DATASET_CONFIG,
-            "shard_size": shard_size,
-            "git_sha": current_sha,
-            "job_id": settings.job_id,
-            "complete": False,
-        }
+    temp_root = (
+        Path(tempfile.gettempdir())
+        / f"fineweb-s3-{settings.preparation_run_id}"
     )
+    free_bytes = require_free_disk(temp_root, minimum_free_gib)
+    phase = "storage_probe"
+    progress: dict[str, Any] = {
+        "schema_version": 1,
+        "source_dataset": DATASET_ID,
+        "dataset_configuration": DEFAULT_DATASET_CONFIG,
+        "shard_size": shard_size,
+        "git_sha": current_sha,
+        "preparation_run_id": settings.preparation_run_id,
+        "givemeanode_job_id": settings.job_id,
+        "complete": False,
+        "shards": [],
+    }
     manifest: dict[str, Any] | None = None
     try:
+        storage_probe(active_client, settings)
+        put_json(
+            active_client,
+            settings,
+            settings.key(
+                "runs",
+                settings.preparation_run_id,
+                "startup.json",
+            ),
+            {
+                "status": "startup_verified",
+                "preparation_run_id": settings.preparation_run_id,
+                "givemeanode_job_id": settings.job_id,
+                "git_sha": current_sha,
+                "started_at": started_at,
+                "bucket": settings.bucket,
+                "prefix": settings.prefix,
+                "endpoint_hostname": settings.endpoint_hostname,
+                "region": settings.region,
+                "free_bytes": free_bytes,
+                "minimum_required_gib": minimum_free_gib,
+                "storage_probe_passed": True,
+            },
+        )
+
+        phase = "complete_marker_check"
+        if already_complete(active_client, settings):
+            result = {
+                "status": "already_complete",
+                "bucket": settings.bucket,
+                "prefix": settings.prefix,
+                "git_sha": current_sha,
+                "preparation_run_id": settings.preparation_run_id,
+                "givemeanode_job_id": settings.job_id,
+            }
+            put_json(
+                active_client,
+                settings,
+                settings.key(
+                    "runs",
+                    settings.preparation_run_id,
+                    "final_status.json",
+                ),
+                {
+                    **result,
+                    "finished_at": utc_now(),
+                    "storage_probe_passed": True,
+                },
+            )
+            write_small_output(settings, result)
+            LOGGER.info(
+                "verified COMPLETE marker; no dataset preparation required"
+            )
+            return result
+
+        hf_cache = temp_root / "hf-cache"
+        os.environ["HF_HOME"] = str(hf_cache)
+        os.environ["HF_DATASETS_CACHE"] = str(hf_cache / "datasets")
+        vocabulary_size = tokenizer().n_vocab
+
+        phase = "resume_validation"
+        progress = load_progress(active_client, settings)
+        progress.update(
+            {
+                "source_dataset": DATASET_ID,
+                "dataset_configuration": DEFAULT_DATASET_CONFIG,
+                "shard_size": shard_size,
+                "git_sha": current_sha,
+                "preparation_run_id": settings.preparation_run_id,
+                "givemeanode_job_id": settings.job_id,
+                "complete": False,
+            }
+        )
         verified = verify_existing_shards(
             active_client,
             settings,
@@ -999,6 +1113,8 @@ def run(
             vocabulary_size=vocabulary_size,
         )
         upload_progress(active_client, settings, progress)
+
+        phase = "dataset_download_and_tokenization"
         dataset = dataset_loader()
         records = create_and_upload_shards(
             active_client,
@@ -1011,6 +1127,8 @@ def run(
             shard_size=shard_size,
             vocabulary_size=vocabulary_size,
         )
+
+        phase = "final_validation"
         validation = final_validation(
             active_client,
             settings,
@@ -1019,16 +1137,23 @@ def run(
             shard_size=shard_size,
             vocabulary_size=vocabulary_size,
         )
+        finished_at = utc_now()
         manifest = build_manifest(
             settings,
             records,
             validation,
             preparation_git_sha=current_sha,
+            preparation_started_at=started_at,
+            preparation_finished_at=finished_at,
             shard_size=shard_size,
         )
+
+        phase = "final_metadata_publication"
         progress["complete"] = True
         upload_progress(active_client, settings, progress)
         marker = publish_final_metadata(active_client, settings, manifest)
+
+        phase = "complete_marker_verification"
         if not verify_manifest_reference(active_client, settings, marker):
             active_client.delete_object(
                 Bucket=settings.bucket,
@@ -1045,7 +1170,8 @@ def run(
             "total_token_count": marker["total_token_count"],
             "total_bytes": marker["total_bytes"],
             "git_sha": current_sha,
-            "job_id": settings.job_id,
+            "preparation_run_id": settings.preparation_run_id,
+            "givemeanode_job_id": settings.job_id,
         }
         try:
             write_small_output(settings, result)
@@ -1067,19 +1193,43 @@ def run(
                 ),
                 content_type="text/markdown",
             )
+            put_json(
+                active_client,
+                settings,
+                settings.key(
+                    "runs",
+                    settings.preparation_run_id,
+                    "final_status.json",
+                ),
+                {
+                    "status": "incomplete",
+                    "failing_phase": phase,
+                    "failure_type": type(error).__name__,
+                    "preparation_run_id": settings.preparation_run_id,
+                    "givemeanode_job_id": settings.job_id,
+                    "git_sha": current_sha,
+                    "started_at": started_at,
+                    "finished_at": utc_now(),
+                },
+            )
         except Exception:
             LOGGER.error("failed to publish incomplete progress metadata")
-        write_small_output(
-            settings,
-            {
-                "status": "incomplete",
-                "bucket": settings.bucket,
-                "prefix": settings.prefix,
-                "git_sha": current_sha,
-                "job_id": settings.job_id,
-                "failure_type": type(error).__name__,
-            },
-        )
+        try:
+            write_small_output(
+                settings,
+                {
+                    "status": "incomplete",
+                    "bucket": settings.bucket,
+                    "prefix": settings.prefix,
+                    "git_sha": current_sha,
+                    "preparation_run_id": settings.preparation_run_id,
+                    "givemeanode_job_id": settings.job_id,
+                    "failing_phase": phase,
+                    "failure_type": type(error).__name__,
+                },
+            )
+        except OSError:
+            LOGGER.warning("could not write the small local failure pointer")
         LOGGER.error("dataset preparation failed (%s)", type(error).__name__)
         raise
     finally:
