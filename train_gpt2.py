@@ -458,6 +458,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark-steps", type=int)
     parser.add_argument("--checkpoint-interval", type=int)
     parser.add_argument("--hellaswag-interval", type=int)
+    parser.add_argument(
+        "--max-runtime-seconds",
+        type=int,
+        help="gracefully checkpoint and pause after this much training-loop wall time",
+    )
     return parser
 
 
@@ -541,7 +546,7 @@ def git_commit_sha() -> str:
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
         ).strip()
     except (OSError, subprocess.CalledProcessError):
-        return "unknown"
+        return os.environ.get("GMN_SOURCE_GIT_SHA", "unknown")
 
 
 def checkpoint_payload(
@@ -762,6 +767,10 @@ class WandbLogger:
                 wandb.watch(model, log="gradients", log_freq=10)
         except Exception as exc:
             self._failed = True
+            if self.mode == "online":
+                raise RuntimeError(
+                    "W&B online initialization failed; refusing to train without monitoring"
+                ) from exc
             print(f"warning: W&B initialization failed; continuing locally: {exc}")
 
     def log(self, metrics: Mapping[str, Any], step: int) -> None:
@@ -940,6 +949,15 @@ def train(args: argparse.Namespace, config: dict[str, Any]) -> None:
     evaluation = config["evaluation"]
     checkpointing = config["checkpointing"]
     logging_config = config["logging"]
+    if (
+        logging_config.get("wandb_mode") == "online"
+        and not os.environ.get("WANDB_API_KEY")
+    ):
+        raise ConfigurationError(
+            "WANDB_API_KEY is required when logging.wandb_mode is online"
+        )
+    if args.max_runtime_seconds is not None and args.max_runtime_seconds <= 0:
+        raise ConfigurationError("--max-runtime-seconds must be positive")
     for split in ("train", "val"):
         if not any(data_root.glob(f"*{split}*.npy")):
             raise FileNotFoundError(
@@ -1049,8 +1067,14 @@ def train(args: argparse.Namespace, config: dict[str, Any]) -> None:
     }
     wandb_logger = WandbLogger(logging_config.get("wandb_mode", "disabled"), master)
     started = time.monotonic()
+    runtime_deadline = (
+        started + args.max_runtime_seconds
+        if args.max_runtime_seconds is not None
+        else None
+    )
     exit_code = 1
     state = "running"
+    paused = False
     final_step = start_step - 1
     benchmark_steps = args.benchmark_steps
     stop_step = training["max_steps"]
@@ -1252,9 +1276,17 @@ def train(args: argparse.Namespace, config: dict[str, Any]) -> None:
                             keep_last=checkpointing["keep_last"],
                             protected_steps=set(checkpointing["milestone_steps"]),
                         )
+                if runtime_deadline is not None and time.monotonic() >= runtime_deadline:
+                    paused = True
+                    if master:
+                        print(
+                            f"training runtime budget reached after step {step}; "
+                            "writing a resumable checkpoint"
+                        )
+                    break
 
             # Benchmarks intentionally skip expensive final evaluation.
-            if benchmark_steps is None:
+            if benchmark_steps is None and not paused:
                 if last_validation_step != final_step:
                     latest_validation = _validation_loss(
                         training_model,
@@ -1323,7 +1355,7 @@ def train(args: argparse.Namespace, config: dict[str, Any]) -> None:
                 if final_path.exists():
                     raise FileExistsError(f"refusing to overwrite final checkpoint {final_path}")
                 atomic_torch_save(payload, final_path)
-            state = "completed"
+            state = "paused" if paused else "completed"
             exit_code = 0
     except BaseException:
         state = "error"

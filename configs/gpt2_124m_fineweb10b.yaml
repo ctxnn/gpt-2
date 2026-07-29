@@ -32,7 +32,7 @@ evaluation:
   full_hellaswag_at_end: true
 
 checkpointing:
-  interval: 1000
+  interval: 500
   keep_last: 3
   milestone_steps:
     - 5000

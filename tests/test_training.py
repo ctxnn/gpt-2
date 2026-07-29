@@ -296,6 +296,21 @@ def test_wandb_offline_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert calls["log"][1] == 1
 
 
+def test_wandb_online_initialization_failure_is_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_init(**kwargs):
+        del kwargs
+        raise RuntimeError("authentication failed")
+
+    monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(init=fail_init))
+    logger = WandbLogger("online", master_process=True)
+    with pytest.raises(RuntimeError, match="refusing to train without monitoring"):
+        logger.initialize(
+            project="test", entity=None, name=None, run_id="id", config={}
+        )
+
+
 def test_tiny_cpu_forward_and_backward() -> None:
     model = tiny_model()
     x = torch.randint(0, 32, (2, 8))
