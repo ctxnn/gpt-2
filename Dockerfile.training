@@ -12,10 +12,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WANDB_CONSOLE=off \
     GMN_SOURCE_GIT_SHA=${SOURCE_GIT_SHA}
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 RUN python -c "import os, pathlib, shutil, urllib.request; sha=os.environ['GMN_SOURCE_GIT_SHA']; assert len(sha) == 40; archive=pathlib.Path('/tmp/source.tar.gz'); urllib.request.urlretrieve(f'https://github.com/ctxnn/gpt-2/archive/{sha}.tar.gz', archive); shutil.unpack_archive(archive, '/opt'); pathlib.Path('/opt/gpt-2').symlink_to(pathlib.Path('/opt') / f'gpt-2-{sha}')" \
     && test -f /opt/gpt-2/train_gpt2.py \
     && test -f /opt/gpt-2/scripts/train_gpt2_cloud.py
