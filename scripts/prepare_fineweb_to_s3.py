@@ -72,6 +72,8 @@ HF_LOAD_ATTEMPTS = 5
 HF_RETRY_BACKOFF_SECONDS = 2.0
 HF_HUB_DOWNLOAD_TIMEOUT_SECONDS = 120
 HF_HUB_ETAG_TIMEOUT_SECONDS = 30
+S3_UPLOAD_ATTEMPTS = 5
+S3_UPLOAD_RETRY_BACKOFF_SECONDS = 2.0
 
 
 def utc_now() -> str:
@@ -770,20 +772,34 @@ def upload_verified_shard(
     digest = sha256_file(path)
     local_bytes = path.stat().st_size
     key = settings.key(SHARD_PREFIX, path.name)
-    client.upload_file(
-        str(path),
-        settings.bucket,
-        key,
-        ExtraArgs={
-            "Metadata": {
-                "sha256": digest,
-                "token-count": str(int(tokens.size)),
-                "split": split,
-                "shard-index": str(index),
-            }
-        },
-        Config=TransferConfig(),
-    )
+    for attempt in range(1, S3_UPLOAD_ATTEMPTS + 1):
+        try:
+            client.upload_file(
+                str(path),
+                settings.bucket,
+                key,
+                ExtraArgs={
+                    "Metadata": {
+                        "sha256": digest,
+                        "token-count": str(int(tokens.size)),
+                        "split": split,
+                        "shard-index": str(index),
+                    }
+                },
+                Config=TransferConfig(),
+            )
+            break
+        except Exception as error:
+            if attempt == S3_UPLOAD_ATTEMPTS:
+                raise
+            LOGGER.warning(
+                "shard upload attempt %d/%d failed for %s: %s",
+                attempt,
+                S3_UPLOAD_ATTEMPTS,
+                path.name,
+                _safe_error_detail(error),
+            )
+            time.sleep(S3_UPLOAD_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
     head = client.head_object(Bucket=settings.bucket, Key=key)
     remote_bytes = int(head["ContentLength"])
     if remote_bytes != local_bytes:

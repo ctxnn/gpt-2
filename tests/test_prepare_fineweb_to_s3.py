@@ -144,6 +144,18 @@ class UploadFailureS3(FakeS3):
         raise RuntimeError("simulated upload failure")
 
 
+class TransientUploadFailureS3(FakeS3):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 2
+
+    def upload_file(self, *args: Any, **kwargs: Any) -> None:
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("simulated transient gateway failure")
+        super().upload_file(*args, **kwargs)
+
+
 @pytest.fixture
 def environment(tmp_path: Path) -> dict[str, str]:
     return {
@@ -644,6 +656,26 @@ def test_upload_verifies_download_when_gateway_drops_metadata(
         )["Metadata"]
         == {}
     )
+
+
+def test_upload_retries_transient_gateway_failure(
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = TransientUploadFailureS3()
+    sleeps: list[float] = []
+    monkeypatch.setattr("scripts.prepare_fineweb_to_s3.time.sleep", sleeps.append)
+    record = seed_shard(
+        client,
+        settings,
+        tmp_path,
+        "edufineweb_val_000000.npy",
+        np.array([1, 2, 3, 4], dtype=np.uint16),
+        shard_size=4,
+    )
+    assert record["checksum_verification"] == "downloaded_sha256"
+    assert sleeps == [2.0, 4.0]
 
 
 def test_upload_rejects_corrupt_download_and_retains_local_shard(
