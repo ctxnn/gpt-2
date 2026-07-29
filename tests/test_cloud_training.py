@@ -14,6 +14,9 @@ class FakeS3:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.metadata: dict[str, dict[str, str]] = {}
+        self.get_calls: list[tuple[str, str | None]] = []
+        self.upload_calls = 0
+        self.head_calls = 0
 
     def put_object(self, *, Bucket, Key, Body, Metadata=None, **kwargs):
         del Bucket, kwargs
@@ -21,12 +24,20 @@ class FakeS3:
         self.metadata[Key] = dict(Metadata or {})
         return {}
 
-    def get_object(self, *, Bucket, Key):
+    def get_object(self, *, Bucket, Key, Range=None):
         del Bucket
-        return {"Body": io.BytesIO(self.objects[Key])}
+        self.get_calls.append((Key, Range))
+        content = self.objects[Key]
+        response = {"Body": io.BytesIO(content)}
+        if Range:
+            offset = int(Range.removeprefix("bytes=").removesuffix("-"))
+            response["Body"] = io.BytesIO(content[offset:])
+            response["ContentRange"] = f"bytes {offset}-{len(content) - 1}/{len(content)}"
+        return response
 
     def head_object(self, *, Bucket, Key):
         del Bucket
+        self.head_calls += 1
         return {
             "ContentLength": len(self.objects[Key]),
             "Metadata": self.metadata.get(Key, {}),
@@ -34,6 +45,7 @@ class FakeS3:
 
     def upload_file(self, Filename, Bucket, Key, ExtraArgs=None):
         del Bucket
+        self.upload_calls += 1
         self.objects[Key] = Path(Filename).read_bytes()
         self.metadata[Key] = dict((ExtraArgs or {}).get("Metadata", {}))
 
@@ -135,7 +147,7 @@ def test_manifest_and_concurrent_dataset_staging(
     assert not list(tmp_path.rglob("*.part"))
 
 
-def test_checkpoint_upload_remote_hash_latest_pointer_and_resume(
+def test_checkpoint_upload_head_metadata_latest_pointer_and_resume(
     settings: cloud.CloudSettings,
 ) -> None:
     client = FakeS3()
@@ -151,13 +163,69 @@ def test_checkpoint_upload_remote_hash_latest_pointer_and_resume(
     latest = json.loads(client.objects[latest_key])
     assert latest["step"] == 500
     assert latest["sha256"] == cloud.sha256_file(checkpoint)
+    assert not client.get_calls
     restored, restored_record = cloud.find_latest_verified_checkpoint(client, settings)
     assert restored is not None
     assert restored.read_bytes() == checkpoint.read_bytes()
     assert restored_record == latest
 
 
-def test_remote_checkpoint_corruption_is_rejected(
+def test_checkpoint_upload_retries_transient_upload_failure(
+    settings: cloud.CloudSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TransientUploadS3(FakeS3):
+        def upload_file(self, Filename, Bucket, Key, ExtraArgs=None):
+            if self.upload_calls == 0:
+                self.upload_calls += 1
+                raise OSError("temporary upload failure")
+            super().upload_file(Filename, Bucket, Key, ExtraArgs)
+
+    monkeypatch.setattr(cloud.time, "sleep", lambda _: None)
+    client = TransientUploadS3()
+    checkpoint = settings.output_dir / "checkpoints/checkpoint_step_000500.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint payload")
+
+    record = cloud.upload_verified_file(
+        client,
+        settings,
+        checkpoint,
+        settings.training_key("checkpoints", checkpoint.name),
+    )
+
+    assert client.upload_calls == 2
+    assert record["sha256"] == cloud.sha256_file(checkpoint)
+
+
+def test_checkpoint_upload_retries_transient_head_failure(
+    settings: cloud.CloudSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TransientHeadS3(FakeS3):
+        def head_object(self, *, Bucket, Key):
+            if self.head_calls == 0:
+                self.head_calls += 1
+                raise OSError("temporary HEAD failure")
+            return super().head_object(Bucket=Bucket, Key=Key)
+
+    monkeypatch.setattr(cloud.time, "sleep", lambda _: None)
+    client = TransientHeadS3()
+    checkpoint = settings.output_dir / "checkpoints/checkpoint_step_000500.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint payload")
+
+    cloud.upload_verified_file(
+        client,
+        settings,
+        checkpoint,
+        settings.training_key("checkpoints", checkpoint.name),
+    )
+
+    assert client.head_calls == 2
+
+
+def test_latest_pointer_not_advanced_before_checkpoint_verification(
     settings: cloud.CloudSettings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -165,16 +233,157 @@ def test_remote_checkpoint_corruption_is_rejected(
     checkpoint = settings.output_dir / "checkpoints/checkpoint_step_000500.pt"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"checkpoint payload")
+    original_head = client.head_object
 
-    monkeypatch.setattr(cloud, "_remote_sha256", lambda *args: "0" * 64)
-    with pytest.raises(RuntimeError, match="checksum mismatch"):
-        cloud.upload_verified_file(
-            client,
-            settings,
-            checkpoint,
-            settings.training_key("checkpoints", checkpoint.name),
-        )
-    assert checkpoint.is_file()
+    def corrupt_head(*, Bucket, Key):
+        head = original_head(Bucket=Bucket, Key=Key)
+        if Key.endswith(".pt"):
+            head["Metadata"] = {"sha256": "0" * 64}
+        return head
+
+    monkeypatch.setattr(client, "head_object", corrupt_head)
+    monkeypatch.setattr(cloud.time, "sleep", lambda _: None)
+    sync = cloud.ArtifactSync(client, settings)
+
+    with pytest.raises(RuntimeError, match="checksum metadata mismatch"):
+        sync.sync_once()
+
+    assert settings.training_key("checkpoints", "LATEST.json") not in client.objects
+
+
+def test_synchronizer_recovers_after_temporary_error(
+    settings: cloud.CloudSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync = cloud.ArtifactSync(FakeS3(), settings)
+    calls = 0
+    waits = iter((False, False, True))
+
+    def sync_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("temporary sync error")
+
+    monkeypatch.setattr(sync, "sync_once", sync_once)
+    monkeypatch.setattr(sync.stop_event, "wait", lambda _: next(waits))
+    monkeypatch.setattr(cloud.time, "sleep", lambda _: None)
+
+    sync._run()
+
+    assert calls == 3
+    assert sync.error is None
+
+
+def test_synchronizer_failure_is_bounded(
+    settings: cloud.CloudSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sync = cloud.ArtifactSync(FakeS3(), settings)
+    calls = 0
+
+    def sync_once() -> None:
+        nonlocal calls
+        calls += 1
+        raise OSError("persistent sync error")
+
+    monkeypatch.setattr(sync, "sync_once", sync_once)
+    monkeypatch.setattr(sync.stop_event, "wait", lambda _: False)
+    monkeypatch.setattr(cloud.time, "sleep", lambda _: None)
+
+    sync._run()
+
+    assert calls == cloud.SYNC_FAILURE_LIMIT
+    assert isinstance(sync.error, OSError)
+
+
+def test_interrupted_checkpoint_download_resumes_with_range(
+    settings: cloud.CloudSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InterruptedBody(io.BytesIO):
+        def __init__(self, content: bytes) -> None:
+            super().__init__(content)
+            self.failed = False
+
+        def read(self, size=-1):
+            if self.failed:
+                raise OSError("interrupted response stream")
+            chunk = super().read(min(size, 5) if size >= 0 else 5)
+            self.failed = True
+            return chunk
+
+    class InterruptedDownloadS3(FakeS3):
+        def get_object(self, *, Bucket, Key, Range=None):
+            if Key.endswith(".pt") and Range is None:
+                self.get_calls.append((Key, Range))
+                return {"Body": InterruptedBody(self.objects[Key])}
+            return super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+
+    monkeypatch.setattr(cloud.time, "sleep", lambda _: None)
+    client = InterruptedDownloadS3()
+    key = settings.training_key("checkpoints", "checkpoint_step_003000.pt")
+    content = b"verified checkpoint payload"
+    client.objects[key] = content
+    client.metadata[key] = {"sha256": cloud.sha256_bytes(content)}
+    latest = {
+        "key": key,
+        "filename": Path(key).name,
+        "bytes": len(content),
+        "sha256": cloud.sha256_bytes(content),
+        "step": 3000,
+    }
+    cloud.put_json(
+        client,
+        settings.bucket,
+        settings.training_key("checkpoints", "LATEST.json"),
+        latest,
+    )
+
+    restored, _ = cloud.find_latest_verified_checkpoint(client, settings)
+
+    assert restored is not None
+    assert restored.read_bytes() == content
+    assert (key, "bytes=5-") in client.get_calls
+
+
+def test_corrupt_resumed_checkpoint_download_is_rejected(
+    settings: cloud.CloudSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cloud.time, "sleep", lambda _: None)
+    client = FakeS3()
+    key = settings.training_key("checkpoints", "checkpoint_step_003000.pt")
+    expected = b"expected checkpoint payload"
+    corrupt = b"corrupt! checkpoint payload"
+    assert len(corrupt) == len(expected)
+    client.objects[key] = corrupt
+    client.metadata[key] = {"sha256": cloud.sha256_bytes(expected)}
+    latest = {
+        "key": key,
+        "filename": Path(key).name,
+        "bytes": len(expected),
+        "sha256": cloud.sha256_bytes(expected),
+        "step": 3000,
+    }
+    cloud.put_json(
+        client,
+        settings.bucket,
+        settings.training_key("checkpoints", "LATEST.json"),
+        latest,
+    )
+    temporary = (
+        settings.output_dir
+        / "resume"
+        / "checkpoint_step_003000.part"
+    )
+    temporary.parent.mkdir(parents=True)
+    temporary.write_bytes(corrupt[:5])
+
+    with pytest.raises(RuntimeError, match="failed download verification"):
+        cloud.find_latest_verified_checkpoint(client, settings)
+
+    assert not temporary.exists()
 
 
 def test_only_completed_training_publishes_complete(

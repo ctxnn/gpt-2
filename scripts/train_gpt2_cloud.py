@@ -33,6 +33,8 @@ EXPECTED_SHARDS = 100
 EXPECTED_TOKENS = 9_953_989_344
 CHECKPOINT_RE = re.compile(r"(?:checkpoint|final)_step_(\d{6})\.pt$")
 MILESTONE_STEPS = {5_000, 10_000, 15_000, 19_073}
+S3_RETRY_ATTEMPTS = 4
+SYNC_FAILURE_LIMIT = 3
 SENSITIVE_ENV_NAMES = {
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
@@ -163,18 +165,48 @@ def get_object_bytes(client: Any, bucket: str, key: str) -> bytes:
             body.close()
 
 
+def retry_s3(
+    operation: Any,
+    description: str,
+    *,
+    attempts: int = S3_RETRY_ATTEMPTS,
+    base_delay: float = 1.0,
+) -> Any:
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return operation()
+        except BaseException as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            delay = base_delay * (2 ** (attempt - 1))
+            print(
+                f"{description} failed on attempt {attempt}/{attempts}; "
+                f"retrying in {delay:g}s: {sanitized(str(exc))}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
 def put_json(client: Any, bucket: str, key: str, value: Mapping[str, Any]) -> bytes:
     encoded = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    client.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=encoded,
-        ContentType="application/json",
-        Metadata={"sha256": sha256_bytes(encoded)},
-    )
-    head = client.head_object(Bucket=bucket, Key=key)
-    if int(head["ContentLength"]) != len(encoded):
-        raise RuntimeError(f"remote size mismatch for {key}")
+
+    def publish() -> None:
+        client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=encoded,
+            ContentType="application/json",
+            Metadata={"sha256": sha256_bytes(encoded)},
+        )
+        head = client.head_object(Bucket=bucket, Key=key)
+        if int(head["ContentLength"]) != len(encoded):
+            raise RuntimeError(f"remote size mismatch for {key}")
+
+    retry_s3(publish, f"publish {key}")
     return encoded
 
 
@@ -290,43 +322,40 @@ def stage_dataset(
     }
 
 
-def _remote_sha256(client: Any, bucket: str, key: str) -> str:
-    body = client.get_object(Bucket=bucket, Key=key)["Body"]
-    digest = hashlib.sha256()
-    try:
-        for chunk in _iter_body(body):
-            digest.update(chunk)
-    finally:
-        with contextlib.suppress(Exception):
-            body.close()
-    return digest.hexdigest()
-
-
 def upload_verified_file(
     client: Any, settings: CloudSettings, path: Path, key: str
 ) -> dict[str, Any]:
     local_bytes = path.stat().st_size
     local_sha = sha256_file(path)
-    client.upload_file(
-        str(path),
-        settings.bucket,
-        key,
-        ExtraArgs={"Metadata": {"sha256": local_sha}},
+    retry_s3(
+        lambda: client.upload_file(
+            str(path),
+            settings.bucket,
+            key,
+            ExtraArgs={"Metadata": {"sha256": local_sha}},
+        ),
+        f"upload {key}",
     )
-    head = client.head_object(Bucket=settings.bucket, Key=key)
-    remote_bytes = int(head["ContentLength"])
-    if remote_bytes != local_bytes:
-        raise RuntimeError(f"remote checkpoint size mismatch for {key}")
-    remote_sha = _remote_sha256(client, settings.bucket, key)
-    if remote_sha != local_sha:
-        raise RuntimeError(f"remote checkpoint checksum mismatch for {key}")
+
+    def verify_head() -> None:
+        head = client.head_object(Bucket=settings.bucket, Key=key)
+        if int(head["ContentLength"]) != local_bytes:
+            raise RuntimeError(f"remote checkpoint size mismatch for {key}")
+        remote_sha = str(head.get("Metadata", {}).get("sha256", ""))
+        if remote_sha != local_sha:
+            raise RuntimeError(f"remote checkpoint checksum metadata mismatch for {key}")
+
+    retry_s3(verify_head, f"verify {key}")
     checksum_key = f"{key}.sha256"
     checksum_bytes = f"{local_sha}  {path.name}\n".encode("utf-8")
-    client.put_object(
-        Bucket=settings.bucket,
-        Key=checksum_key,
-        Body=checksum_bytes,
-        ContentType="text/plain",
+    retry_s3(
+        lambda: client.put_object(
+            Bucket=settings.bucket,
+            Key=checksum_key,
+            Body=checksum_bytes,
+            ContentType="text/plain",
+        ),
+        f"publish {checksum_key}",
     )
     return {
         "key": key,
@@ -395,27 +424,73 @@ def find_latest_verified_checkpoint(
         raise RuntimeError("LATEST.json points outside this training run")
     destination = settings.output_dir / "resume" / Path(key).name
     destination.parent.mkdir(parents=True, exist_ok=True)
-    body = client.get_object(Bucket=settings.bucket, Key=key)["Body"]
-    digest = hashlib.sha256()
-    with destination.with_suffix(".part").open("wb") as handle:
-        try:
-            for chunk in _iter_body(body):
-                handle.write(chunk)
-                digest.update(chunk)
-        finally:
-            with contextlib.suppress(Exception):
-                body.close()
-        handle.flush()
-        os.fsync(handle.fileno())
+    expected_bytes = int(latest["bytes"])
+    expected_sha = str(latest["sha256"])
+
+    def verify_remote_head() -> None:
+        head = client.head_object(Bucket=settings.bucket, Key=key)
+        if int(head["ContentLength"]) != expected_bytes:
+            raise RuntimeError("latest remote checkpoint size does not match LATEST.json")
+        if str(head.get("Metadata", {}).get("sha256", "")) != expected_sha:
+            raise RuntimeError("latest remote checkpoint metadata does not match LATEST.json")
+
+    retry_s3(verify_remote_head, f"verify resume checkpoint {key}")
     temporary = destination.with_suffix(".part")
-    if (
-        temporary.stat().st_size != int(latest["bytes"])
-        or digest.hexdigest() != latest["sha256"]
-    ):
+    if destination.is_file():
+        if (
+            destination.stat().st_size == expected_bytes
+            and sha256_file(destination) == expected_sha
+        ):
+            return destination, latest
+        destination.unlink()
+    if temporary.is_file() and temporary.stat().st_size > expected_bytes:
+        temporary.unlink()
+
+    last_error: BaseException | None = None
+    for attempt in range(1, S3_RETRY_ATTEMPTS + 1):
+        offset = temporary.stat().st_size if temporary.is_file() else 0
+        kwargs: dict[str, Any] = {"Bucket": settings.bucket, "Key": key}
+        if offset:
+            kwargs["Range"] = f"bytes={offset}-"
+        body: Any | None = None
+        try:
+            response = client.get_object(**kwargs)
+            body = response["Body"]
+            if offset and "ContentRange" not in response:
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError("checkpoint server ignored requested Range")
+            with temporary.open("ab") as handle:
+                for chunk in _iter_body(body):
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if temporary.stat().st_size != expected_bytes:
+                raise RuntimeError("checkpoint download ended before the expected byte size")
+            if sha256_file(temporary) != expected_sha:
+                temporary.unlink(missing_ok=True)
+                raise RuntimeError("latest remote checkpoint failed checksum verification")
+            os.replace(temporary, destination)
+            return destination, latest
+        except BaseException as exc:
+            last_error = exc
+            if attempt == S3_RETRY_ATTEMPTS:
+                break
+            delay = 2 ** (attempt - 1)
+            print(
+                f"checkpoint download failed on attempt "
+                f"{attempt}/{S3_RETRY_ATTEMPTS}; retrying in {delay}s: "
+                f"{sanitized(str(exc))}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        finally:
+            if body is not None:
+                with contextlib.suppress(Exception):
+                    body.close()
+    if temporary.is_file() and temporary.stat().st_size == expected_bytes:
         temporary.unlink(missing_ok=True)
-        raise RuntimeError("latest remote checkpoint failed download verification")
-    os.replace(temporary, destination)
-    return destination, latest
+    assert last_error is not None
+    raise RuntimeError("latest remote checkpoint failed download verification") from last_error
 
 
 class ArtifactSync:
@@ -427,6 +502,8 @@ class ArtifactSync:
         self.error: BaseException | None = None
         self.synced: dict[int, dict[str, Any]] = {}
         self.latest: dict[str, Any] | None = None
+        self.failure_step: int | None = None
+        self.consecutive_failures = 0
 
     def start(self) -> None:
         self.thread.start()
@@ -470,11 +547,22 @@ class ArtifactSync:
             if not path.is_file():
                 continue
             content = path.read_bytes()
-            self.client.put_object(
-                Bucket=self.settings.bucket,
-                Key=self.settings.training_key(suffix),
-                Body=content,
+            key = self.settings.training_key(suffix)
+            retry_s3(
+                lambda: self.client.put_object(
+                    Bucket=self.settings.bucket,
+                    Key=key,
+                    Body=content,
+                ),
+                f"publish {key}",
             )
+
+    def _next_unsynced_step(self) -> int | None:
+        for path in self._checkpoint_candidates():
+            step = checkpoint_step(path)
+            if step is not None and step not in self.synced:
+                return step
+        return None
 
     def sync_once(self) -> None:
         for path in self._checkpoint_candidates():
@@ -498,13 +586,33 @@ class ArtifactSync:
         self._sync_small_artifacts()
 
     def _run(self) -> None:
-        try:
-            while not self.stop_event.wait(15):
+        while True:
+            stopping = self.stop_event.wait(15)
+            try:
                 self.sync_once()
-            self.sync_once()
-        except BaseException as exc:
-            self.error = exc
-            self.stop_event.set()
+                self.failure_step = None
+                self.consecutive_failures = 0
+                if stopping:
+                    return
+            except BaseException as exc:
+                step = self._next_unsynced_step()
+                if step == self.failure_step:
+                    self.consecutive_failures += 1
+                else:
+                    self.failure_step = step
+                    self.consecutive_failures = 1
+                if self.consecutive_failures >= SYNC_FAILURE_LIMIT:
+                    self.error = exc
+                    self.stop_event.set()
+                    return
+                delay = 2 ** (self.consecutive_failures - 1)
+                print(
+                    f"artifact sync failed for checkpoint step {step}; "
+                    f"retry {self.consecutive_failures}/{SYNC_FAILURE_LIMIT} "
+                    f"in {delay}s: {sanitized(str(exc))}",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
 
 
 def write_local_json(path: Path, value: Mapping[str, Any]) -> None:
