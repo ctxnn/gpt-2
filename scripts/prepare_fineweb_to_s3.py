@@ -551,6 +551,9 @@ def storage_probe(client: Any, settings: Settings) -> None:
     probe = os.urandom(64)
     try:
         client.put_object(Bucket=settings.bucket, Key=probe_key, Body=probe)
+        head = client.head_object(Bucket=settings.bucket, Key=probe_key)
+        if int(head["ContentLength"]) != len(probe):
+            raise RuntimeError("S3 probe HEAD size verification failed")
         downloaded = get_object_bytes(client, settings, probe_key)
         if downloaded != probe:
             raise RuntimeError("S3 probe byte verification failed")

@@ -1,8 +1,9 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from fineweb import validate_shard_filenames
+from fineweb import prepare_dataset, validate_shard_filenames
 
 
 def shard(name: str) -> Path:
@@ -72,3 +73,61 @@ def test_validate_shard_filenames_rejects_duplicate_validation_shard() -> None:
                 shard("edufineweb_train_000001.npy"),
             ]
         )
+
+
+def test_prepare_dataset_calls_shard_hook_and_stops_after_full_shard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = [
+        {"tokens": np.array([1, 2, 3], dtype=np.uint16)},
+        {"tokens": np.array([4, 5, 6], dtype=np.uint16)},
+    ]
+
+    class Pool:
+        def __init__(self, _: int) -> None:
+            pass
+
+        def __enter__(self) -> "Pool":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def imap(self, function, values, *, chunksize: int):
+            assert chunksize == 16
+            return map(function, values)
+
+    monkeypatch.setattr("fineweb.load_dataset", lambda *args, **kwargs: dataset)
+    monkeypatch.setattr("fineweb.mp.Pool", Pool)
+    monkeypatch.setattr("fineweb.tokenize", lambda item: item["tokens"])
+    seen: list[tuple[str, str, int, int, np.ndarray]] = []
+
+    def callback(
+        path: Path,
+        split: str,
+        index: int,
+        token_count: int,
+    ) -> bool:
+        seen.append(
+            (
+                path.name,
+                split,
+                index,
+                token_count,
+                np.load(path, allow_pickle=False),
+            )
+        )
+        return True
+
+    prepare_dataset(
+        output_dir=tmp_path,
+        shard_size=4,
+        workers=32,
+        shard_callback=callback,
+    )
+
+    assert len(seen) == 1
+    assert seen[0][:4] == ("edufineweb_val_000000.npy", "val", 0, 4)
+    np.testing.assert_array_equal(seen[0][4], np.array([1, 2, 3, 4]))
+    assert not (tmp_path / "edufineweb_train_000001.npy").exists()

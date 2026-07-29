@@ -12,7 +12,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import tiktoken
@@ -119,6 +119,7 @@ def prepare_dataset(
     dataset_config: str = DEFAULT_DATASET_CONFIG,
     shard_size: int = DEFAULT_SHARD_SIZE,
     workers: int | None = None,
+    shard_callback: Callable[[Path, str, int, int], bool] | None = None,
 ) -> None:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -148,9 +149,20 @@ def prepare_dataset(
                 if token_count == shard_size:
                     split = "val" if shard_index == 0 else "train"
                     write_datafile(
-                        output / f"edufineweb_{split}_{shard_index:06d}.npy",
+                        shard_path := (
+                            output
+                            / f"edufineweb_{split}_{shard_index:06d}.npy"
+                        ),
                         buffer,
                     )
+                    if shard_callback is not None and shard_callback(
+                        shard_path,
+                        split,
+                        shard_index,
+                        shard_size,
+                    ):
+                        progress.close()
+                        return
                     progress.close()
                     progress = None
                     shard_index += 1
@@ -158,12 +170,22 @@ def prepare_dataset(
         if token_count:
             split = "val" if shard_index == 0 else "train"
             write_datafile(
-                output / f"edufineweb_{split}_{shard_index:06d}.npy",
+                shard_path := (
+                    output / f"edufineweb_{split}_{shard_index:06d}.npy"
+                ),
                 buffer[:token_count],
             )
+            if shard_callback is not None:
+                shard_callback(
+                    shard_path,
+                    split,
+                    shard_index,
+                    token_count,
+                )
             if progress is not None:
                 progress.close()
-    validate_shard_filenames(output.iterdir())
+    if shard_callback is None:
+        validate_shard_filenames(output.iterdir())
 
 
 def main() -> int:

@@ -42,6 +42,7 @@ from scripts.prepare_fineweb_to_s3 import (
     upload_verified_shard,
     verify_existing_shards,
 )
+from scripts.prepare_fineweb_original_to_s3 import run_original_loader
 
 
 class MissingObject(Exception):
@@ -293,6 +294,14 @@ def test_failed_s3_probe_raises_and_cleans_up(settings: Settings) -> None:
     client = FakeS3()
     client.fail_probe_read = True
     with pytest.raises(RuntimeError, match="probe byte verification"):
+        storage_probe(client, settings)
+    assert not any("/probes/" in f"/{key}/" for _, key in client.objects)
+
+
+def test_s3_probe_verifies_head_size_and_cleans_up(settings: Settings) -> None:
+    client = FakeS3()
+    client.head_size_delta = 1
+    with pytest.raises(RuntimeError, match="probe HEAD size verification"):
         storage_probe(client, settings)
     assert not any("/probes/" in f"/{key}/" for _, key in client.objects)
 
@@ -908,3 +917,108 @@ def test_malformed_remote_filename_is_rejected(
             shard_size=4,
             vocabulary_size=50_257,
         )
+
+
+def test_original_loader_smoke_uploads_first_shard_and_leaves_complete_absent(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = FakeS3()
+    events: list[str] = []
+    monkeypatch.setenv("GMN_STOP_AFTER_VERIFIED_SHARDS", "1")
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.tokenizer",
+        lambda: type("Encoding", (), {"n_vocab": 50_257})(),
+    )
+
+    def prepare_with_original_callback(
+        *,
+        output_dir: Path,
+        dataset_config: str,
+        shard_size: int,
+        workers: int,
+        shard_callback,
+    ) -> None:
+        events.append("fineweb_loader")
+        assert dataset_config == "sample-10BT"
+        assert workers == 32
+        path = output_dir / "edufineweb_val_000000.npy"
+        atomic_write_npy(path, np.array([1, 2, 3, 4], dtype=np.uint16))
+        assert shard_callback(path, "val", 0, shard_size) is True
+
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.prepare_dataset",
+        prepare_with_original_callback,
+    )
+    result = run_original_loader(
+        settings,
+        client=client,
+        shard_size=4,
+        workers=32,
+        work_root=tmp_path,
+    )
+
+    assert events == ["fineweb_loader"]
+    assert result["status"] == "smoke_complete"
+    assert result["storage_probe_passed"] is True
+    assert result["verified_shard"]["filename"] == "edufineweb_val_000000.npy"
+    assert result["verified_shard"]["token_count"] == 4
+    assert (
+        settings.bucket,
+        settings.key(SHARD_PREFIX, "edufineweb_val_000000.npy"),
+    ) in client.objects
+    assert (
+        settings.bucket,
+        settings.key(METADATA_PREFIX, PROGRESS_NAME),
+    ) in client.objects
+    assert (
+        settings.bucket,
+        settings.key(STATUS_PREFIX, COMPLETE_NAME),
+    ) not in client.objects
+
+
+def test_original_loader_keeps_local_shard_when_upload_fails(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = UploadFailureS3()
+    monkeypatch.setenv("GMN_STOP_AFTER_VERIFIED_SHARDS", "1")
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.tokenizer",
+        lambda: type("Encoding", (), {"n_vocab": 50_257})(),
+    )
+
+    def prepare_then_fail(
+        *,
+        output_dir: Path,
+        shard_size: int,
+        shard_callback,
+        **_: Any,
+    ) -> None:
+        path = output_dir / "edufineweb_val_000000.npy"
+        atomic_write_npy(path, np.array([1, 2, 3, 4], dtype=np.uint16))
+        shard_callback(path, "val", 0, shard_size)
+
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.prepare_dataset",
+        prepare_then_fail,
+    )
+    with pytest.raises(RuntimeError, match="simulated upload failure"):
+        run_original_loader(
+            settings,
+            client=client,
+            shard_size=4,
+            workers=32,
+            work_root=tmp_path,
+        )
+
+    retained = (
+        tmp_path
+        / "fineweb-original-s3"
+        / settings.preparation_run_id
+        / "edu_fineweb10B"
+        / "edufineweb_val_000000.npy"
+    )
+    assert retained.exists()
