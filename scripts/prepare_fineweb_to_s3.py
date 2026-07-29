@@ -1210,15 +1210,17 @@ def build_report(
         )
         disk = manifest.get("disk_preflight")
         if disk:
-            lines.extend(
-                [
-                    f"- Disk filesystem: {disk['filesystem']}",
-                    f"- Disk mount: {disk['mount_path']}",
-                    f"- Disk available GiB: {disk['available_gib']}",
-                    f"- Disk required GiB: {disk['budget']['required_gib']}",
-                    "- Disk model: streaming source/cache with progressive shard upload and local deletion",
-                ]
-            )
+            if disk.get("filesystem"):
+                lines.append(f"- Disk filesystem: {disk['filesystem']}")
+            if disk.get("mount_path"):
+                lines.append(f"- Disk mount: {disk['mount_path']}")
+            if disk.get("available_gib") is not None:
+                lines.append(f"- Disk available GiB: {disk['available_gib']}")
+            budget = disk.get("budget")
+            if budget and budget.get("required_gib") is not None:
+                lines.append(f"- Disk required GiB: {budget['required_gib']}")
+            if disk.get("model"):
+                lines.append(f"- Disk model: {disk['model']}")
     if failure_type:
         lines.append(f"- Failure type: {failure_type}")
     lines.append("")

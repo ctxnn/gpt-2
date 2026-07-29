@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
+import sys
+import traceback
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -30,6 +33,7 @@ from scripts.prepare_fineweb_to_s3 import (
     load_progress,
     object_exists,
     publish_final_metadata,
+    put_json,
     replace_progress_record,
     sha256_file,
     stop_after_verified_shards,
@@ -41,6 +45,56 @@ from scripts.prepare_fineweb_to_s3 import (
     verify_existing_shards,
     write_small_output,
 )
+
+LOGGER = logging.getLogger("fineweb_s3.original")
+
+
+def _redact_sensitive_text(value: str, settings: Settings | None = None) -> str:
+    secrets = {
+        os.environ.get("AWS_ACCESS_KEY_ID", ""),
+        os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+    }
+    if settings is not None:
+        secrets.update({settings.access_key_id, settings.secret_access_key})
+    redacted = value
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "<redacted>")
+    return redacted
+
+
+def _sanitized_exception_message(
+    error: BaseException,
+    settings: Settings | None = None,
+) -> str:
+    message = " ".join(str(error).split()) or type(error).__name__
+    return _redact_sensitive_text(message, settings)[:1000]
+
+
+def _sanitized_traceback(
+    error: BaseException,
+    settings: Settings | None = None,
+) -> str:
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    return _redact_sensitive_text(rendered, settings)
+
+
+def _sanitized_excepthook(
+    exception_type: type[BaseException],
+    error: BaseException,
+    exception_traceback: Any,
+) -> None:
+    """Preserve the uncaught traceback while redacting credential values."""
+
+    if issubclass(exception_type, KeyboardInterrupt):
+        sys.__excepthook__(exception_type, error, exception_traceback)
+        return
+    rendered = "".join(
+        traceback.format_exception(exception_type, error, exception_traceback)
+    )
+    sys.stderr.write(_redact_sensitive_text(rendered))
 
 
 def run_original_loader(
@@ -72,6 +126,10 @@ def run_original_loader(
         "used_bytes": usage.used,
         "available_bytes": usage.free,
         "available_gib": round(usage.free / (1024**3), 3),
+        "model": (
+            "full Hugging Face dataset cache with progressive token-shard "
+            "upload and verified local-shard deletion"
+        ),
     }
     progress: dict[str, Any] = {
         "schema_version": 1,
@@ -237,35 +295,69 @@ def run_original_loader(
         cleanup_work_dir = True
         return result
     except Exception as error:
+        error_message = _sanitized_exception_message(error, settings)
+        LOGGER.error(
+            "dataset preparation failed phase=%s type=%s message=%s\n%s",
+            phase,
+            type(error).__name__,
+            error_message,
+            _sanitized_traceback(error, settings),
+        )
         progress["complete"] = False
         try:
             upload_progress(active_client, settings, progress)
+            failure_report = build_report(
+                manifest,
+                complete=False,
+                failure_type=type(error).__name__,
+            )
+            failure_report += (
+                f"- Failing phase: {phase}\n"
+                f"- Error message: {error_message}\n"
+            )
             upload_text(
                 active_client,
                 settings,
                 settings.key(METADATA_PREFIX, REPORT_NAME),
-                build_report(
-                    manifest,
-                    complete=False,
-                    failure_type=type(error).__name__,
-                ),
+                failure_report,
                 content_type="text/markdown",
+            )
+            failure_status = {
+                "status": "incomplete",
+                "bucket": settings.bucket,
+                "prefix": settings.prefix,
+                "git_sha": source_sha,
+                "preparation_run_id": settings.preparation_run_id,
+                "givemeanode_job_id": settings.job_id,
+                "failing_phase": phase,
+                "failure_type": type(error).__name__,
+                "error_message": error_message,
+                "started_at": started_at,
+                "finished_at": utc_now(),
+                "disk": disk,
+            }
+            put_json(
+                active_client,
+                settings,
+                settings.key(
+                    "runs",
+                    settings.preparation_run_id,
+                    "final_status.json",
+                ),
+                failure_status,
             )
             write_small_output(
                 settings,
-                {
-                    "status": "incomplete",
-                    "bucket": settings.bucket,
-                    "prefix": settings.prefix,
-                    "git_sha": source_sha,
-                    "preparation_run_id": settings.preparation_run_id,
-                    "failing_phase": phase,
-                    "failure_type": type(error).__name__,
-                    "disk": disk,
-                },
+                failure_status,
             )
-        except Exception:
-            pass
+        except Exception as publication_error:
+            LOGGER.error(
+                "failed to publish incomplete preparation metadata "
+                "type=%s message=%s\n%s",
+                type(publication_error).__name__,
+                _sanitized_exception_message(publication_error, settings),
+                _sanitized_traceback(publication_error, settings),
+            )
         raise
     finally:
         if cleanup_work_dir:
@@ -274,6 +366,7 @@ def run_original_loader(
 
 def main() -> int:
     configure_logging()
+    sys.excepthook = _sanitized_excepthook
     settings = Settings.from_environment()
     run_original_loader(settings)
     return 0

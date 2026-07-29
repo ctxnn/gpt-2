@@ -98,7 +98,13 @@ def test_prepare_dataset_calls_shard_hook_and_stops_after_full_shard(
             assert chunksize == 16
             return map(function, values)
 
-    monkeypatch.setattr("fineweb.load_dataset", lambda *args, **kwargs: dataset)
+    loader_calls: list[tuple[str, dict[str, str]]] = []
+
+    def original_loader(dataset_id: str, **kwargs: str):
+        loader_calls.append((dataset_id, kwargs))
+        return dataset
+
+    monkeypatch.setattr("fineweb.load_dataset", original_loader)
     monkeypatch.setattr("fineweb.mp.Pool", Pool)
     monkeypatch.setattr("fineweb.tokenize", lambda item: item["tokens"])
     seen: list[tuple[str, str, int, int, np.ndarray]] = []
@@ -127,6 +133,12 @@ def test_prepare_dataset_calls_shard_hook_and_stops_after_full_shard(
         shard_callback=callback,
     )
 
+    assert loader_calls == [
+        (
+            "HuggingFaceFW/fineweb-edu",
+            {"name": "sample-10BT", "split": "train"},
+        )
+    ]
     assert len(seen) == 1
     assert seen[0][:4] == ("edufineweb_val_000000.npy", "val", 0, 4)
     np.testing.assert_array_equal(seen[0][4], np.array([1, 2, 3, 4]))

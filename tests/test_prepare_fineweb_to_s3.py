@@ -42,7 +42,11 @@ from scripts.prepare_fineweb_to_s3 import (
     upload_verified_shard,
     verify_existing_shards,
 )
-from scripts.prepare_fineweb_original_to_s3 import run_original_loader
+from scripts.prepare_fineweb_original_to_s3 import (
+    _sanitized_excepthook,
+    main as original_loader_main,
+    run_original_loader,
+)
 
 
 class MissingObject(Exception):
@@ -1022,3 +1026,153 @@ def test_original_loader_keeps_local_shard_when_upload_fails(
         / "edufineweb_val_000000.npy"
     )
     assert retained.exists()
+
+
+def test_original_loader_uploads_each_shard_deletes_it_and_writes_complete_last(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class RecordingS3(FakeS3):
+        def __init__(self) -> None:
+            super().__init__()
+            self.put_keys: list[str] = []
+
+        def put_object(self, *, Key: str, **kwargs: Any) -> dict[str, Any]:
+            self.put_keys.append(Key)
+            return super().put_object(Key=Key, **kwargs)
+
+    client = RecordingS3()
+    monkeypatch.delenv("GMN_STOP_AFTER_VERIFIED_SHARDS", raising=False)
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.tokenizer",
+        lambda: type("Encoding", (), {"n_vocab": 50_257})(),
+    )
+    callback_results: list[tuple[str, bool, bool]] = []
+
+    def prepare_all_shards(
+        *,
+        output_dir: Path,
+        shard_size: int,
+        shard_callback,
+        **_: Any,
+    ) -> None:
+        for split, index, values in (
+            ("val", 0, [1, 2, 3, 4]),
+            ("train", 1, [5, 6, 7, 8]),
+        ):
+            path = output_dir / f"edufineweb_{split}_{index:06d}.npy"
+            atomic_write_npy(path, np.array(values, dtype=np.uint16))
+            should_stop = shard_callback(path, split, index, shard_size)
+            remote_exists = (
+                settings.bucket,
+                settings.key(SHARD_PREFIX, path.name),
+            ) in client.objects
+            callback_results.append((path.name, remote_exists, path.exists()))
+            assert should_stop is False
+
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.prepare_dataset",
+        prepare_all_shards,
+    )
+    result = run_original_loader(
+        settings,
+        client=client,
+        shard_size=4,
+        workers=32,
+        work_root=tmp_path,
+    )
+
+    assert result["status"] == "complete"
+    assert callback_results == [
+        ("edufineweb_val_000000.npy", True, False),
+        ("edufineweb_train_000001.npy", True, False),
+    ]
+    assert client.uploads == [
+        settings.key(SHARD_PREFIX, "edufineweb_val_000000.npy"),
+        settings.key(SHARD_PREFIX, "edufineweb_train_000001.npy"),
+    ]
+    complete_key = settings.key(STATUS_PREFIX, COMPLETE_NAME)
+    assert (settings.bucket, complete_key) in client.objects
+    assert client.put_keys[-1] == complete_key
+
+
+def test_original_loader_logs_sanitized_traceback_and_persists_failure_detail(
+    settings: Settings,
+    environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = FakeS3()
+    access_key = environment["AWS_ACCESS_KEY_ID"]
+    secret_key = environment["AWS_SECRET_ACCESS_KEY"]
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", access_key)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret_key)
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.tokenizer",
+        lambda: type("Encoding", (), {"n_vocab": 50_257})(),
+    )
+
+    def fail_with_sensitive_message(**_: Any) -> None:
+        raise RuntimeError(f"source failed with {access_key} and {secret_key}")
+
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.prepare_dataset",
+        fail_with_sensitive_message,
+    )
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(RuntimeError, match="source failed"):
+        run_original_loader(
+            settings,
+            client=client,
+            shard_size=4,
+            workers=32,
+            work_root=tmp_path,
+        )
+
+    logged = caplog.text
+    assert "Traceback (most recent call last)" in logged
+    assert "original_fineweb_preparation" in logged
+    assert "<redacted>" in logged
+    assert access_key not in logged
+    assert secret_key not in logged
+
+    status_key = settings.key(
+        "runs",
+        settings.preparation_run_id,
+        "final_status.json",
+    )
+    status = json.loads(
+        client.objects[(settings.bucket, status_key)]["Body"].decode("utf-8")
+    )
+    assert status["failing_phase"] == "original_fineweb_preparation"
+    assert status["failure_type"] == "RuntimeError"
+    assert "<redacted>" in status["error_message"]
+    serialized = json.dumps(status)
+    assert access_key not in serialized
+    assert secret_key not in serialized
+    assert (
+        settings.bucket,
+        settings.key(STATUS_PREFIX, COMPLETE_NAME),
+    ) not in client.objects
+
+
+def test_original_loader_main_preserves_exception_propagation(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = RuntimeError("diagnostic failure")
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.Settings.from_environment",
+        lambda: settings,
+    )
+    monkeypatch.setattr(
+        "scripts.prepare_fineweb_original_to_s3.run_original_loader",
+        lambda _: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(RuntimeError, match="diagnostic failure"):
+        original_loader_main()
+
+    assert __import__("sys").excepthook is _sanitized_excepthook
