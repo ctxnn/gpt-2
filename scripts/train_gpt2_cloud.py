@@ -431,8 +431,15 @@ def find_latest_verified_checkpoint(
         head = client.head_object(Bucket=settings.bucket, Key=key)
         if int(head["ContentLength"]) != expected_bytes:
             raise RuntimeError("latest remote checkpoint size does not match LATEST.json")
-        if str(head.get("Metadata", {}).get("sha256", "")) != expected_sha:
+        remote_sha = str(head.get("Metadata", {}).get("sha256", ""))
+        if remote_sha and remote_sha != expected_sha:
             raise RuntimeError("latest remote checkpoint metadata does not match LATEST.json")
+        if not remote_sha:
+            print(
+                "resume checkpoint has no SHA-256 object metadata; "
+                "using the verified LATEST.json checksum and validating the "
+                "complete download before torch.load"
+            )
 
     retry_s3(verify_remote_head, f"verify resume checkpoint {key}")
     temporary = destination.with_suffix(".part")

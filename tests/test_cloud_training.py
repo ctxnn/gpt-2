@@ -170,6 +170,35 @@ def test_checkpoint_upload_head_metadata_latest_pointer_and_resume(
     assert restored_record == latest
 
 
+def test_legacy_checkpoint_without_object_metadata_resumes_after_full_hash(
+    settings: cloud.CloudSettings,
+) -> None:
+    client = FakeS3()
+    key = settings.training_key("checkpoints", "checkpoint_step_003000.pt")
+    content = b"legacy verified checkpoint payload"
+    client.objects[key] = content
+    latest = {
+        "key": key,
+        "filename": Path(key).name,
+        "bytes": len(content),
+        "sha256": cloud.sha256_bytes(content),
+        "step": 3000,
+    }
+    cloud.put_json(
+        client,
+        settings.bucket,
+        settings.training_key("checkpoints", "LATEST.json"),
+        latest,
+    )
+
+    restored, restored_record = cloud.find_latest_verified_checkpoint(client, settings)
+
+    assert restored is not None
+    assert restored.read_bytes() == content
+    assert cloud.sha256_file(restored) == latest["sha256"]
+    assert restored_record == latest
+
+
 def test_checkpoint_upload_retries_transient_upload_failure(
     settings: cloud.CloudSettings,
     monkeypatch: pytest.MonkeyPatch,
