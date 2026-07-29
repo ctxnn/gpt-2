@@ -230,6 +230,38 @@ def test_rng_restoration_moves_cpu_state_back_to_cpu(
     assert cpu_calls == 1
 
 
+def test_rng_restoration_moves_cuda_states_back_to_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = capture_rng_state()
+    cuda_calls = 0
+    restored_states = None
+
+    class DeviceMappedRngState:
+        def __init__(self, value: torch.Tensor) -> None:
+            self.value = value
+
+        def cpu(self):
+            nonlocal cuda_calls
+            cuda_calls += 1
+            return self.value
+
+    expected_states = [torch.tensor([1, 2], dtype=torch.uint8)]
+    state["cuda"] = [DeviceMappedRngState(value) for value in expected_states]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def capture_cuda_states(states):
+        nonlocal restored_states
+        restored_states = states
+
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", capture_cuda_states)
+
+    restore_rng_state(state)
+
+    assert cuda_calls == 1
+    assert restored_states == expected_states
+
+
 def test_atomic_checkpoint_never_replaces_good_file_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

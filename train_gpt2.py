@@ -535,7 +535,9 @@ def restore_rng_state(state: Mapping[str, Any]) -> None:
         np.random.set_state(state["numpy"])
         torch.set_rng_state(state["cpu"].cpu())
         if torch.cuda.is_available() and state.get("cuda"):
-            torch.cuda.set_rng_state_all(state["cuda"])
+            torch.cuda.set_rng_state_all(
+                [device_state.cpu() for device_state in state["cuda"]]
+            )
     except (KeyError, TypeError, RuntimeError, ValueError) as exc:
         raise CheckpointError("checkpoint contains invalid RNG state") from exc
 
