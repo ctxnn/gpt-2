@@ -209,6 +209,27 @@ def test_rng_restoration() -> None:
     assert torch.equal(actual[2], expected[2])
 
 
+def test_rng_restoration_moves_cpu_state_back_to_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = capture_rng_state()
+    original_cpu_state = state["cpu"]
+    cpu_calls = 0
+
+    class DeviceMappedRngState:
+        def cpu(self):
+            nonlocal cpu_calls
+            cpu_calls += 1
+            return original_cpu_state
+
+    state["cpu"] = DeviceMappedRngState()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    restore_rng_state(state)
+
+    assert cpu_calls == 1
+
+
 def test_atomic_checkpoint_never_replaces_good_file_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

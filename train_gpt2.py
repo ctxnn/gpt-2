@@ -533,7 +533,7 @@ def restore_rng_state(state: Mapping[str, Any]) -> None:
     try:
         random.setstate(state["python"])
         np.random.set_state(state["numpy"])
-        torch.set_rng_state(state["cpu"])
+        torch.set_rng_state(state["cpu"].cpu())
         if torch.cuda.is_available() and state.get("cuda"):
             torch.cuda.set_rng_state_all(state["cuda"])
     except (KeyError, TypeError, RuntimeError, ValueError) as exc:
