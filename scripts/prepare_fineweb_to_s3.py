@@ -708,7 +708,10 @@ def verify_existing_shards(
             metadata=metadata,
             shard_size=shard_size,
         ):
-            verified[filename] = record
+            verified[filename] = {
+                **record,
+                "checksum_verification": "metadata_sha256",
+            }
             continue
 
         local = work_dir / f"inspect-{filename}"
@@ -734,6 +737,7 @@ def verify_existing_shards(
                 "sha256": actual_sha,
                 "etag": str(head.get("ETag", "")).strip('"'),
                 "remote_key": key,
+                "checksum_verification": "downloaded_sha256",
                 "upload_timestamp": record.get("upload_timestamp", utc_now())
                 if record
                 else utc_now(),
@@ -786,9 +790,25 @@ def upload_verified_shard(
         raise RuntimeError(
             f"remote size mismatch for {path.name}: {remote_bytes} != {local_bytes}"
         )
-    metadata = {str(k).lower(): str(v) for k, v in head.get("Metadata", {}).items()}
-    if metadata.get("sha256") != digest:
-        raise RuntimeError(f"remote SHA-256 metadata mismatch for {path.name}")
+    remote_copy = path.with_name(f".{path.name}.remote-verify-{uuid.uuid4().hex}")
+    try:
+        remote_token_count, downloaded_bytes, remote_digest = inspect_downloaded_shard(
+            client,
+            settings,
+            key,
+            remote_copy,
+            shard_size=shard_size,
+            allow_partial=allow_partial,
+            vocabulary_size=vocabulary_size,
+        )
+        if remote_token_count != int(tokens.size):
+            raise RuntimeError(f"remote token count mismatch for {path.name}")
+        if downloaded_bytes != local_bytes:
+            raise RuntimeError(f"downloaded byte count mismatch for {path.name}")
+        if remote_digest != digest:
+            raise RuntimeError(f"downloaded SHA-256 mismatch for {path.name}")
+    finally:
+        remote_copy.unlink(missing_ok=True)
     return {
         "filename": path.name,
         "split": split,
@@ -799,6 +819,7 @@ def upload_verified_shard(
         "sha256": digest,
         "etag": str(head.get("ETag", "")).strip('"'),
         "remote_key": key,
+        "checksum_verification": "downloaded_sha256",
         "upload_timestamp": utc_now(),
     }
 
@@ -978,13 +999,25 @@ def verify_manifest_reference(
                 Bucket=settings.bucket,
                 Key=shard["remote_key"],
             )
+            if int(head["ContentLength"]) != int(shard["remote_bytes"]):
+                return False
+            current_etag = str(head.get("ETag", "")).strip('"')
+            method = shard.get("checksum_verification")
             metadata = {
                 str(k).lower(): str(v)
                 for k, v in head.get("Metadata", {}).items()
             }
-            if int(head["ContentLength"]) != int(shard["remote_bytes"]):
-                return False
-            if metadata.get("sha256") != shard["sha256"]:
+            downloaded_sha_verified = (
+                method == "downloaded_sha256"
+                and bool(shard.get("sha256"))
+                and bool(shard.get("etag"))
+                and current_etag == shard["etag"]
+            )
+            metadata_sha_verified = (
+                method == "metadata_sha256"
+                and metadata.get("sha256") == shard.get("sha256")
+            )
+            if not (downloaded_sha_verified or metadata_sha_verified):
                 return False
     except Exception:
         return False
@@ -1062,13 +1095,27 @@ def final_validation(
             Bucket=settings.bucket,
             Key=str(record["remote_key"]),
         )
+        if int(head["ContentLength"]) != int(record["remote_bytes"]):
+            raise ValueError(f"remote size mismatch for {shard.path.name}")
+        current_etag = str(head.get("ETag", "")).strip('"')
+        method = record.get("checksum_verification")
         metadata = {
             str(k).lower(): str(v) for k, v in head.get("Metadata", {}).items()
         }
-        if int(head["ContentLength"]) != int(record["remote_bytes"]):
-            raise ValueError(f"remote size mismatch for {shard.path.name}")
-        if metadata.get("sha256") != record["sha256"]:
-            raise ValueError(f"remote SHA-256 mismatch for {shard.path.name}")
+        downloaded_sha_verified = (
+            method == "downloaded_sha256"
+            and bool(record.get("sha256"))
+            and bool(record.get("etag"))
+            and current_etag == record["etag"]
+        )
+        metadata_sha_verified = (
+            method == "metadata_sha256"
+            and metadata.get("sha256") == record.get("sha256")
+        )
+        if not (downloaded_sha_verified or metadata_sha_verified):
+            raise ValueError(
+                f"remote verification record mismatch for {shard.path.name}"
+            )
         expected_count = int(record["token_count"])
         if position < len(ordered) - 1 and expected_count != shard_size:
             raise ValueError(f"non-final shard is partial: {shard.path.name}")

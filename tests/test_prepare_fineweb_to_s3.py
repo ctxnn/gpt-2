@@ -62,6 +62,8 @@ class FakeS3:
         self.objects: dict[tuple[str, str], dict[str, Any]] = {}
         self.fail_probe_read = False
         self.head_size_delta = 0
+        self.preserve_metadata = True
+        self.corrupt_downloads = False
         self.uploads: list[str] = []
 
     def put_object(
@@ -76,7 +78,7 @@ class FakeS3:
         content = bytes(Body)
         self.objects[(Bucket, Key)] = {
             "Body": content,
-            "Metadata": dict(Metadata or {}),
+            "Metadata": dict(Metadata or {}) if self.preserve_metadata else {},
             "ETag": hashlib.md5(content).hexdigest(),
         }
         return {}
@@ -131,7 +133,10 @@ class FakeS3:
         )
 
     def download_file(self, Bucket: str, Key: str, Filename: str) -> None:
-        Path(Filename).write_bytes(self.objects[(Bucket, Key)]["Body"])
+        content = self.objects[(Bucket, Key)]["Body"]
+        if self.corrupt_downloads:
+            content = content[:-1] + bytes([content[-1] ^ 1])
+        Path(Filename).write_bytes(content)
 
 
 class UploadFailureS3(FakeS3):
@@ -615,6 +620,53 @@ def test_remote_size_verification(settings: Settings, tmp_path: Path) -> None:
         shard_size=4,
     )
     assert record["local_bytes"] == record["remote_bytes"]
+
+
+def test_upload_verifies_download_when_gateway_drops_metadata(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    client = FakeS3()
+    client.preserve_metadata = False
+    record = seed_shard(
+        client,
+        settings,
+        tmp_path,
+        "edufineweb_val_000000.npy",
+        np.array([1, 2, 3, 4], dtype=np.uint16),
+        shard_size=4,
+    )
+    assert record["checksum_verification"] == "downloaded_sha256"
+    assert (
+        client.head_object(
+            Bucket=settings.bucket,
+            Key=record["remote_key"],
+        )["Metadata"]
+        == {}
+    )
+
+
+def test_upload_rejects_corrupt_download_and_retains_local_shard(
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    client = FakeS3()
+    client.corrupt_downloads = True
+    path = tmp_path / "edufineweb_val_000000.npy"
+    atomic_write_npy(path, np.array([1, 2, 3, 4], dtype=np.uint16))
+    with pytest.raises(RuntimeError, match="downloaded SHA-256 mismatch"):
+        upload_verified_shard(
+            client,
+            settings,
+            path,
+            split="val",
+            index=0,
+            shard_size=4,
+            allow_partial=False,
+            vocabulary_size=50_257,
+        )
+    assert path.exists()
+    assert not list(tmp_path.glob(".*.remote-verify-*"))
 
 
 def test_remote_size_mismatch_fails(settings: Settings, tmp_path: Path) -> None:
