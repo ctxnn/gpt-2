@@ -342,7 +342,7 @@ def upload_verified_file(
         if int(head["ContentLength"]) != local_bytes:
             raise RuntimeError(f"remote checkpoint size mismatch for {key}")
         remote_sha = str(head.get("Metadata", {}).get("sha256", ""))
-        if remote_sha != local_sha:
+        if remote_sha and remote_sha != local_sha:
             raise RuntimeError(f"remote checkpoint checksum metadata mismatch for {key}")
 
     retry_s3(verify_head, f"verify {key}")
@@ -357,6 +357,13 @@ def upload_verified_file(
         ),
         f"publish {checksum_key}",
     )
+
+    def verify_checksum_sidecar() -> None:
+        remote_checksum = get_object_bytes(client, settings.bucket, checksum_key)
+        if remote_checksum != checksum_bytes:
+            raise RuntimeError(f"remote checkpoint checksum sidecar mismatch for {key}")
+
+    retry_s3(verify_checksum_sidecar, f"verify {checksum_key}")
     return {
         "key": key,
         "filename": path.name,

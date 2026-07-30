@@ -163,11 +163,60 @@ def test_checkpoint_upload_head_metadata_latest_pointer_and_resume(
     latest = json.loads(client.objects[latest_key])
     assert latest["step"] == 500
     assert latest["sha256"] == cloud.sha256_file(checkpoint)
-    assert not client.get_calls
+    assert (f"{latest['key']}.sha256", None) in client.get_calls
     restored, restored_record = cloud.find_latest_verified_checkpoint(client, settings)
     assert restored is not None
     assert restored.read_bytes() == checkpoint.read_bytes()
     assert restored_record == latest
+
+
+def test_checkpoint_upload_uses_verified_sidecar_when_metadata_is_dropped(
+    settings: cloud.CloudSettings,
+) -> None:
+    class MetadataDroppingS3(FakeS3):
+        def upload_file(self, Filename, Bucket, Key, ExtraArgs=None):
+            super().upload_file(Filename, Bucket, Key, ExtraArgs=None)
+
+    client = MetadataDroppingS3()
+    checkpoint = settings.output_dir / "checkpoints/checkpoint_step_003500.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint payload without gateway metadata")
+    sync = cloud.ArtifactSync(client, settings)
+
+    sync.sync_once()
+
+    latest_key = settings.training_key("checkpoints", "LATEST.json")
+    latest = json.loads(client.objects[latest_key])
+    assert latest["step"] == 3500
+    checksum_key = f"{latest['key']}.sha256"
+    assert client.objects[checksum_key] == (
+        f"{latest['sha256']}  {checkpoint.name}\n".encode()
+    )
+    assert client.metadata[latest["key"]] == {}
+
+
+def test_latest_pointer_not_advanced_when_checksum_sidecar_is_corrupt(
+    settings: cloud.CloudSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CorruptSidecarS3(FakeS3):
+        def get_object(self, *, Bucket, Key, Range=None):
+            response = super().get_object(Bucket=Bucket, Key=Key, Range=Range)
+            if Key.endswith(".sha256"):
+                response["Body"] = io.BytesIO(b"corrupt checksum sidecar\n")
+            return response
+
+    monkeypatch.setattr(cloud.time, "sleep", lambda _: None)
+    client = CorruptSidecarS3()
+    checkpoint = settings.output_dir / "checkpoints/checkpoint_step_003500.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint payload")
+    sync = cloud.ArtifactSync(client, settings)
+
+    with pytest.raises(RuntimeError, match="checksum sidecar mismatch"):
+        sync.sync_once()
+
+    assert settings.training_key("checkpoints", "LATEST.json") not in client.objects
 
 
 def test_legacy_checkpoint_without_object_metadata_resumes_after_full_hash(
