@@ -5,8 +5,6 @@ This repository implements and pretrains the GPT-2 small architecture from rando
 > [!IMPORTANT]
 > This is a **base text-completion model**, not a chatbot. It was not instruction-tuned, preference-aligned, or safety-tuned. Given a prompt, it continues text; it should not be expected to follow conversational instructions reliably.
 
-![GPT-2 124M pretraining summary](results/graphs/training_summary.png)
-
 ## Final results
 
 | Metric | Result |
