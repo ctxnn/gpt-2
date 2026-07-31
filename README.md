@@ -24,7 +24,7 @@ This repository implements and pretrains the GPT-2 small architecture from rando
 
 The completed [Weights & Biases run](https://wandb.ai/ctxnn-thapar-university/gpt2-from-scratch/runs/65e78f54c14046ef99e04e12e7b3e810) is marked `finished` and reaches history step 19,073. Machine-readable results are available in [final_metrics.json](results/final_metrics.json), [final_checkpoint.json](results/final_checkpoint.json), and [training_history.csv](results/training_history.csv).
 
-**Hugging Face model:** _link will be added after model publication._
+**Hugging Face model:** [ctxnn1/gpt2-124m-fineweb-edu-10b](https://huggingface.co/ctxnn1/gpt2-124m-fineweb-edu-10b)
 
 ## Training curves
 
@@ -110,7 +110,26 @@ s3://gpt2-fineweb10b/training/gpt2-124m-fineweb10b-20260729t103500z-36bfc9e/chec
 - SHA-256: `e519d993d20c98c841ef061f76a1dec3e6ee24d5e55162bdea2a3e2da280fd40`
 - CPU `torch.load`: verified
 
-The object is retained in private project storage; the future Hugging Face release will provide the public model artifact.
+The native training checkpoint remains in private project storage. A vocabulary-trimmed, standard Transformers export is available publicly on [Hugging Face](https://huggingface.co/ctxnn1/gpt2-124m-fineweb-edu-10b).
+
+## Hugging Face export
+
+The reproducible converter is [scripts/export_hf_model.py](scripts/export_hf_model.py). It maps the native PyTorch model into `GPT2LMHeadModel`, transposes native `Linear` projection weights for Hugging Face `Conv1D`, trims the 50,304-row training embeddings to the 50,257-token GPT-2 vocabulary, and preserves tied input/output embeddings.
+
+Install the export dependencies and create a local export with:
+
+```bash
+python -m pip install -r requirements-hf-export.txt
+python -m scripts.export_hf_model \
+  --checkpoint /path/to/final_step_019073.pt \
+  --complete /path/to/COMPLETE.json \
+  --checkpoint-record results/final_checkpoint.json \
+  --metrics results/final_metrics.json \
+  --output-dir /tmp/gpt2-hf-export \
+  --license mit
+```
+
+The published `model.safetensors` contains 124,439,808 parameters and has SHA-256 `6260e630dd15c0f942423d8319428922155b03fbd37e38dc84470a88b95afe6d`. The converter verifies the source checkpoint, parameter mapping, finite values, native/Hugging Face logits and next-token loss, tokenizer parity, clean-process loading, CPU generation, and generated token bounds before publication. See [huggingface_export.json](results/huggingface_export.json) for the machine-readable validation record.
 
 ## Engineering failures and recovery
 
@@ -179,7 +198,7 @@ python train_gpt2.py \
 - HellaSwag accuracy is 30.03%, only modestly above the 25% random-choice baseline.
 - The committed scalar history covers the final continuation segment; the final checkpoint, final evaluation rows, and W&B history provide the authoritative terminal values.
 - The run did not include a comprehensive safety, bias, memorization, or downstream-task evaluation.
-- The checkpoint remains in private object storage until the separate Hugging Face publication step.
+- The native optimizer checkpoint remains private; the public Hugging Face repository contains inference weights only and cannot resume the original optimizer state.
 
 ## Reports
 

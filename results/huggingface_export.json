@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "repository": {
+    "id": "ctxnn1/gpt2-124m-fineweb-edu-10b",
+    "url": "https://huggingface.co/ctxnn1/gpt2-124m-fineweb-edu-10b",
+    "public": true,
+    "verified_revision": "1ee1b9202bb742486fccc456132e14bd9bc77f63"
+  },
+  "source": {
+    "checkpoint_step": 19073,
+    "checkpoint_size_bytes": 1493919114,
+    "checkpoint_sha256": "e519d993d20c98c841ef061f76a1dec3e6ee24d5e55162bdea2a3e2da280fd40",
+    "training_git_sha": "36bfc9edd044eb828e118d49c79532eef8440a2a"
+  },
+  "export": {
+    "format": "safetensors",
+    "model_class": "GPT2LMHeadModel",
+    "parameter_count": 124439808,
+    "model_safetensors_size_bytes": 497774208,
+    "model_safetensors_sha256": "6260e630dd15c0f942423d8319428922155b03fbd37e38dc84470a88b95afe6d",
+    "native_vocab_size": 50304,
+    "export_vocab_size": 50257,
+    "trimmed_embedding_rows": 47,
+    "tied_embeddings": true,
+    "license": "mit"
+  },
+  "validation": {
+    "source_complete_verified": true,
+    "checkpoint_torch_load": true,
+    "missing_parameters": 0,
+    "unexpected_parameters": 0,
+    "finite_parameters": true,
+    "max_absolute_logit_difference": 0.0000209808349609375,
+    "logit_absolute_tolerance": 0.00005,
+    "logit_relative_tolerance": 0.00005,
+    "native_trimmed_next_token_loss": 13.709978103637695,
+    "huggingface_next_token_loss": 13.709978103637695,
+    "tokenizer_parity": true,
+    "clean_process_model_load": true,
+    "clean_process_tokenizer_load": true,
+    "cpu_generation": true,
+    "generated_ids_below_50257": true,
+    "remote_reload": true,
+    "remote_checksum_match": true,
+    "anonymous_public_access": true
+  },
+  "published_files": [
+    ".gitattributes",
+    "README.md",
+    "config.json",
+    "export_metadata.json",
+    "generation_config.json",
+    "merges.txt",
+    "model.safetensors",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json"
+  ]
+}
