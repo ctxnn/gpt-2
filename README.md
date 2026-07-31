@@ -24,7 +24,9 @@ This repository implements and pretrains the GPT-2 small architecture from rando
 
 The completed [Weights & Biases run](https://wandb.ai/ctxnn-thapar-university/gpt2-from-scratch/runs/65e78f54c14046ef99e04e12e7b3e810) is marked `finished` and reaches history step 19,073. Machine-readable results are available in [final_metrics.json](results/final_metrics.json), [final_checkpoint.json](results/final_checkpoint.json), and [training_history.csv](results/training_history.csv).
 
-**Hugging Face model:** _link will be added after model publication._
+**Hugging Face model:** [ctxnn1/gpt2-124m-fineweb-edu-10b](https://huggingface.co/ctxnn1/gpt2-124m-fineweb-edu-10b)
+
+**Live demo:** [Open the GPT-2 124M Gradio Space](https://huggingface.co/spaces/ctxnn1/gpt2-from-scratch-demo) (free, CPU-basic)
 
 ## Training curves
 
