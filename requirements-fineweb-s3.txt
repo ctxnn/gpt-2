@@ -1,0 +1,5 @@
+numpy>=1.26,<3
+boto3>=1.34,<2
+tiktoken>=0.7,<1
+datasets>=2.20,<4
+tqdm>=4.66,<5

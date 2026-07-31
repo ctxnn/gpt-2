@@ -1,0 +1,29 @@
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+ARG SOURCE_GIT_SHA
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache \
+    HF_HOME=/workspace/huggingface \
+    WANDB_SILENT=true \
+    WANDB_CONSOLE=off \
+    GMN_SOURCE_GIT_SHA=${SOURCE_GIT_SHA}
+
+RUN python -c "import os, pathlib, shutil, urllib.request; sha=os.environ['GMN_SOURCE_GIT_SHA']; assert len(sha) == 40; archive=pathlib.Path('/tmp/source.tar.gz'); urllib.request.urlretrieve(f'https://github.com/ctxnn/gpt-2/archive/{sha}.tar.gz', archive); shutil.unpack_archive(archive, '/opt'); pathlib.Path('/opt/gpt-2').symlink_to(pathlib.Path('/opt') / f'gpt-2-{sha}')" \
+    && test -f /opt/gpt-2/train_gpt2.py \
+    && test -f /opt/gpt-2/scripts/train_gpt2_cloud.py
+
+WORKDIR /opt/gpt-2
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r requirements-wandb.txt
+
+RUN mkdir -p "${TIKTOKEN_CACHE_DIR}" \
+    && python -c "import tiktoken; enc=tiktoken.get_encoding('gpt2'); assert enc.n_vocab == 50257" \
+    && python -c "from hellaswag import download; download('val', '/opt/gpt-2/hellaswag')" \
+    && python -m py_compile train_gpt2.py scripts/train_gpt2_cloud.py
+
+ENTRYPOINT ["python", "-u", "-m", "scripts.train_gpt2_cloud"]

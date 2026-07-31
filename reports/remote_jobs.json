@@ -1,0 +1,268 @@
+{
+  "jobs": [
+    {
+      "job_id": "job-tvzbk",
+      "preparation_run_id": "fineweb10b-291cfd5-20260728-01",
+      "pushed_git_sha": "291cfd584c4a34fbb5c14e074284401dd85ae502",
+      "requested_checkout_sha": "291cfd5ecba7b70d3c9108006e8b59a5e56685b3",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T18:23:43.975098+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "submitted",
+      "terminal_status": "failed",
+      "exit_code": 128,
+      "failure_phase": "git_checkout",
+      "failure_reason": "Submitted checkout SHA was not present on the remote branch",
+      "gpu_startup_check": {
+        "passed": true,
+        "visible_gpu_count": 1,
+        "model": "NVIDIA H100 80GB HBM3"
+      },
+      "s3_probe": "not_reached",
+      "first_uploaded_shard": null,
+      "platform_spend_after_failure_usd": 0.0
+    },
+    {
+      "job_id": "job-sstwa",
+      "preparation_run_id": "fineweb10b-20260728T183017Z-96bb90",
+      "approved_git_sha": "291cfd584c4a34fbb5c14e074284401dd85ae502",
+      "branch": "codex/gpt2-h100-training",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T18:30:49.730433+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "queued",
+      "terminal_status": "failed",
+      "exit_code": 1,
+      "failure_phase": "disk_preflight",
+      "failure_reason": "Batch filesystem had less than the required 80 GiB free",
+      "git_checkout_verification": {
+        "passed": true,
+        "verified_sha": "291cfd584c4a34fbb5c14e074284401dd85ae502"
+      },
+      "s3_probe": "not_reached",
+      "first_uploaded_shard": null,
+      "platform_spend_after_failure_usd": 0.0
+    },
+    {
+      "job_id": "job-hejvv",
+      "preparation_run_id": "fineweb10b-20260728T184038Z-501ef6",
+      "approved_git_sha": "3e018cf8b42b72d58301205619155d52319b1211",
+      "branch": "codex/gpt2-h100-training",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T18:41:13.448031+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "queued",
+      "terminal_status": "failed",
+      "exit_code": 1,
+      "failure_phase": "workload_import",
+      "failure_reason": "python scripts/prepare_fineweb_to_s3.py could not import fineweb from the repository root",
+      "filesystem_facts": {
+        "filesystem": "overlay",
+        "mount_path": "/",
+        "paths": ["/tmp", "/workspace", "/workspace/gpt-2"],
+        "same_filesystem": true,
+        "total_bytes": 1598228955136,
+        "used_bytes": 1505086132224,
+        "available_bytes": 93126045696,
+        "available_gib": 86.73
+      },
+      "git_checkout_verification": {
+        "passed": true,
+        "verified_sha": "3e018cf8b42b72d58301205619155d52319b1211"
+      },
+      "gpu_startup_check": {
+        "passed": true,
+        "visible_gpu_count": 1,
+        "model": "NVIDIA H100 80GB HBM3"
+      },
+      "disk_budget_check": "not_reached_by_script",
+      "s3_probe": "not_reached",
+      "first_uploaded_shard": null,
+      "platform_spend_after_failure_usd": 0.0
+    },
+    {
+      "job_id": "job-mjbqk",
+      "preparation_run_id": "fineweb10b-20260728T184548Z-57b90d",
+      "approved_git_sha": "3e018cf8b42b72d58301205619155d52319b1211",
+      "branch": "codex/gpt2-h100-training",
+      "entry_point": "python -u -m scripts.prepare_fineweb_to_s3",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T18:46:13.166217+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "queued",
+      "terminal_status": "failed",
+      "exit_code": 1,
+      "finished_at": "2026-07-28T18:47:28.402201+00:00",
+      "failure_phase": "dataset_download_and_tokenization",
+      "failure_type": "RuntimeError",
+      "failure_reason": "FineWeb streaming download repeatedly received partial parquet responses and terminated before tokenization; no shard was uploaded",
+      "git_checkout_verification": {
+        "passed": true,
+        "verified_sha": "3e018cf8b42b72d58301205619155d52319b1211"
+      },
+      "gpu_startup_check": {
+        "passed": true,
+        "visible_gpu_count": 1,
+        "model": "NVIDIA H100 80GB HBM3"
+      },
+      "disk_budget_check": {
+        "passed": true,
+        "available_gib": 80.892,
+        "required_gib": 8.159,
+        "filesystem": "overlay",
+        "mount_path": "/"
+      },
+      "s3_probe": "passed_before_dataset_download",
+      "first_uploaded_shard": null,
+      "platform_spend_after_failure_usd": 0.0,
+      "artifact": {
+        "artifact_id": "art-its4r",
+        "size_bytes": 10240,
+        "state": "ready"
+      }
+    },
+    {
+      "job_id": "job-rdcwt",
+      "preparation_run_id": "fineweb10b-cached-20260729-a437c05",
+      "approved_git_sha": "a437c0526d4a11ae986e2fe5c7089f54db6f8cd3",
+      "branch": "codex/gpt2-h100-training",
+      "entry_point": "python -u -m scripts.prepare_fineweb_to_s3",
+      "image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T19:02:07.347334+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "submitted",
+      "terminal_status": "failed",
+      "exit_code": 127,
+      "finished_at": "2026-07-28T19:17:17.343309+00:00",
+      "failure_phase": "repository_checkout",
+      "failure_reason": "Selected runtime image does not provide git; command failed before checkout, S3 probe, or FineWeb loading",
+      "s3_probe": "not_reached",
+      "dataset_load": "not_reached",
+      "first_uploaded_shard": null,
+      "credentials_in_returned_metadata": false,
+      "platform_spend_after_failure_usd": 0.0
+    },
+    {
+      "job_id": "job-896vk",
+      "preparation_run_id": "fineweb10b-archive-20260729-7a3acee",
+      "approved_git_sha": "7a3aceeba543f646a322859c39cfb24c8ec5177a",
+      "branch": "codex/gpt2-h100-training",
+      "source_archive_url": "https://github.com/ctxnn/gpt-2/archive/7a3aceeba543f646a322859c39cfb24c8ec5177a.tar.gz",
+      "entry_point": "python -u -m scripts.prepare_fineweb_to_s3",
+      "source_acquisition": "python urllib + tarfile; no git executable required",
+      "image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T19:23:12.225395+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "status_at_submission": "queued",
+      "terminal_status": "failed",
+      "exit_code": 1,
+      "finished_at": "2026-07-28T19:28:52.332479+00:00",
+      "failure_phase": "dataset_download_and_tokenization",
+      "failure_type": "DatasetGenerationError",
+      "failure_reason": "Ordinary cached FineWeb train-split materialization terminated at approximately 58 percent before tokenization; no shard was uploaded",
+      "archive_download": "passed",
+      "repository_extraction": "passed",
+      "module_startup": "passed",
+      "disk_preflight": {
+        "passed": true,
+        "available_gib": 54.386,
+        "required_gib": 54.159
+      },
+      "s3_probe": "passed_before_dataset_load",
+      "dataset_load": "failed_during_cache_materialization",
+      "first_uploaded_shard": null,
+      "credentials_in_returned_metadata": false,
+      "platform_spend_after_failure_usd": 0.0,
+      "result": {
+        "git_sha": "7a3aceeba543f646a322859c39cfb24c8ec5177a",
+        "status": "incomplete"
+      }
+    },
+    {
+      "job_id": "job-2cezh",
+      "preparation_run_id": "fineweb-parquet-smoke-20260728T201020Z-2430a3d",
+      "approved_git_sha": "2430a3ddd108f529f11c8c62806c1ba2f380c35b",
+      "branch": "codex/gpt2-h100-training",
+      "entry_point": "python -u -m scripts.prepare_fineweb_to_s3",
+      "source_acquisition": "git-free exact GitHub commit archive",
+      "image": "nvcr.io/nvidia/pytorch:24.01-py3",
+      "bucket": "gpt2-fineweb10b",
+      "prefix": "v1",
+      "submitted_at": "2026-07-28T20:10:52.661973+00:00",
+      "gpu": {
+        "type": "h100",
+        "count": 1
+      },
+      "rate_per_min_usd": 0.045,
+      "max_duration_minutes": 240,
+      "max_cost_usd": 10.8,
+      "max_restarts": 0,
+      "smoke_stop_after_verified_shards": 1,
+      "status_at_submission": "submitted",
+      "terminal_status": "build_failed",
+      "finished_at": "2026-07-28T20:57:45.938570+00:00",
+      "attempt": 0,
+      "failure_phase": "platform_image_import",
+      "failure_reason": "GiveMeANode registry rejected the imported image with blob upload invalid before creating a GPU attempt",
+      "source_archive_download": "not_reached",
+      "module_startup": "not_reached",
+      "disk_preflight": "not_reached",
+      "s3_probe": "not_reached",
+      "first_uploaded_shard": null,
+      "complete_marker_written": false,
+      "credentials_in_returned_metadata": false,
+      "platform_spend_after_failure_usd": 0.0,
+      "h100_released": true
+    }
+  ]
+}

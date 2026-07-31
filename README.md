@@ -1,120 +1,190 @@
-# gpt2 from scratch 
+# GPT-2 124M from scratch on FineWeb-Edu
 
-## overview
+This repository implements and pretrains the GPT-2 small architecture from random initialization. The completed production run processed **9,999,745,024 tokens** from FineWeb-Edu `sample-10BT` on a single NVIDIA H100 and reached optimizer step **19,073**.
 
-this repository contains code and experiments for training gpt-2 from scratch on the fineweb edu dataset. the goal is to explore the performance of a transformer-based language model when trained on educational web data. various optimizations, techniques, and insights related to transformer training are documented here.
+> [!IMPORTANT]
+> This is a **base text-completion model**, not a chatbot. It was not instruction-tuned, preference-aligned, or safety-tuned. Given a prompt, it continues text; it should not be expected to follow conversational instructions reliably.
 
----
+![GPT-2 124M pretraining summary](results/graphs/training_summary.png)
 
-## training details
+## Final results
 
-so i finished the training on 5000 epochs on 1 gpu for around ~10$, and loss was 3.370812, validation loss was 3.3529 and hellaswag accuracy was 2785/10042=0.2773 which is of course greater than random(25) but if i ran it for more epochs it would’ve been perfect. for now, it’s done.
+| Metric | Result |
+|---|---:|
+| Parameters | 124,475,904 |
+| Optimizer steps | 19,073 |
+| Training tokens | 9,999,745,024 |
+| Final train loss | 3.103327 |
+| Final validation loss | 3.030832 |
+| Validation perplexity | 20.714451 |
+| HellaSwag accuracy | 30.0339% (3,016 / 10,042) |
+| Cumulative training time | 9.402 hours |
+| Aggregate throughput | 295,441 tokens/s |
+| Estimated H100 compute | $25.39 |
 
----
+The completed [Weights & Biases run](https://wandb.ai/ctxnn-thapar-university/gpt2-from-scratch/runs/65e78f54c14046ef99e04e12e7b3e810) is marked `finished` and reaches history step 19,073. Machine-readable results are available in [final_metrics.json](results/final_metrics.json), [final_checkpoint.json](results/final_checkpoint.json), and [training_history.csv](results/training_history.csv).
 
-### about the initialization of the gpt2 model
-- the std deviation of the linear layer should be 0.02 (it is 0.02 cause if it is calculated by 1/sqrt(d_model) and the average value of the d_model of the gpt2 series is 0.02)
-- we want to initialize the bias with zeros
-- we scale the weights of residual path by the factor of 1/sqrt(N), where N is the no of layers
+**Hugging Face model:** _link will be added after model publication._
 
----
+## Training curves
 
-### more about the residual path/stream problem
-- in transformer architectures, each layer adds its output to the residual stream (output = input + layer_output), which causes the variance of activations to accumulate and grow linearly with network depth.
-- without scaling, after n layers, the variance becomes n*V (where V is the initial variance), leading to potential activation explosions and training instability.
-- to solve this, gpt-2 scales down each layer's output by 1/√n, where n = 2*num_layers (doubled because each transformer layer has two residual connections: one after attention and one after mlp).
-- this scaling factor ensures that after n layers, the total variance remains constant (V) instead of growing to nV, as the scaled variance becomes n(V/n) = V.
-- the result is more stable training, balanced layer contributions, and predictable behavior regardless of model depth, which is crucial for deep transformers that can be hundreds of layers.
+The committed history contains the final continuation segment rather than every earlier scalar row. Continuous plots therefore label their observed step range explicitly; final metrics come from the verified step-19,073 checkpoint and final evaluation records.
 
----
+| Training loss | Validation loss |
+|---|---|
+| ![Training loss](results/graphs/training_loss.png) | ![Validation loss](results/graphs/validation_loss.png) |
 
-### intuition
+| Learning rate | Training throughput |
+|---|---|
+| ![Learning rate](results/graphs/learning_rate.png) | ![Training throughput](results/graphs/tokens_per_second.png) |
 
-you're adding dice rolls together:
-- layer 1: you roll a die (random output) → some random number
-- layer 2: you add another die roll → more randomness added
-- layer 3: add another die roll → even more randomness
-- ...and so on
+![HellaSwag accuracy](results/graphs/hellaswag_accuracy.png)
 
-just like adding more dice rolls makes your total number more unpredictable and likely to get larger, each transformer layer adds its own "random" contribution to the residual stream, making the signal increasingly noisy and potentially too large.
+The charts are reproducible offline from the committed JSON and CSV artifacts:
 
----
-
-## using mixed precision
-
-when using bfloat16 with mixed precision pytorch will use bfloat16 for some things (like logits) and then it will use torch.float32 for other things (like wte, wpe etc).
-
----
-
-## using torch.compile
-
-increases the performance (reduces computation time).
-
-- torch.compile sees all the code at the same time (unlike the python interpreter which does not know which operation will come next) and optimizes it (there is no python interpreter involved).
-- it makes the going back and forth with memory less (optimizes the round trips) and we will not pay the memory bandwidth cost anymore.
-- kernel fusion - allows you to keep the data on the chip and it makes the back and forth less.
-
-for more details → [Google Doc](https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8/edit?tab=t.0)
-
----
-
-## flash attention
-
-so what flash attention does is that the $N \times N$ attention matrix never gets read or written to the hbm (it stays on the chip).
-
----
-
-### sometimes the flops don't matter; knowing about memory hierarchy matters
-
----
-
-## one silly optimization
-
-so we want the `vocab_size` to be in the power of 2, cause many cuda kernels work in sort of power of 2.
-
----
-
-## about weight decay
-
-weight decay is a regularization technique used in machine learning to prevent overfitting by discouraging excessively large weights in a model. it works by adding a penalty term to the loss function that depends on the magnitude of the model’s weights.
-
-### mathematical formulation
-
-weight decay is typically implemented using L2 regularization, where the modified loss function becomes:
-
-$$L = L_{\text{original}} + \lambda \sum_{i} w_i^2$$
-
-- $L_{\text{original}}$ is the original loss (e.g., cross-entropy, MSE).
-- $w_i$ are the model’s parameters (weights).
-- $\lambda$ (weight decay factor) controls the strength of regularization.
-
-this penalty encourages smaller weights, reducing model complexity and improving generalization.
-
-#### pytorch implementation example
-
-```python
-import torch.optim as optim
-
-optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+```bash
+python scripts/plot_training_results.py
 ```
 
----
+## Model architecture
 
-## gradient accumulation and batch size
+The implementation follows the GPT-2 small/124M decoder-only Transformer design.
 
-gpt-3 used a batch size of 0.5M, but even with 4-8 A100s, that would be impossible. so we use gradient accumulation.
+| Component | Configuration |
+|---|---:|
+| Transformer blocks | 12 |
+| Attention heads | 12 |
+| Embedding width | 768 |
+| MLP width | 3,072 |
+| Context length | 1,024 tokens |
+| Vocabulary | 50,304 entries (GPT-2 vocabulary padded for efficiency) |
+| Positional encoding | Learned absolute embeddings |
+| Normalization | Pre-layer normalization |
+| Activation | GELU |
+| Weight tying | Token embedding and language-model head |
 
-### why use gradient accumulation?
-- **overcome memory constraints**: instead of using a large batch size (which may not fit in memory), gradients from multiple smaller batches are accumulated and applied at once.
-- **improve stability**: larger effective batch sizes result in more stable updates and better generalization.
-- **match performance of large-batch training**: allows training with small batches while mimicking the behavior of larger batches.
+The training code includes causal multi-head self-attention, GPT-2 residual projection scaling, fused AdamW when supported, gradient accumulation, bfloat16 autocasting, gradient clipping, cosine learning-rate decay, deterministic validation, HellaSwag evaluation, and resumable checkpointing.
 
----
+## Dataset and training configuration
 
-## about using hellaswag eval
+- **Dataset:** `HuggingFaceFW/fineweb-edu`, configuration `sample-10BT`
+- **Tokenizer:** GPT-2 `tiktoken`
+- **Shard format:** NumPy `uint16`, 100,000,000 tokens per full shard
+- **Prepared data:** 100 verified shards, approximately 19.9 GB
+- **Effective batch:** 524,288 tokens per optimizer step
+- **Micro-batch:** 16 sequences × 1,024 tokens
+- **Precision:** bfloat16
+- **Maximum learning rate:** `6e-4`
+- **Minimum learning rate:** `6e-5`
+- **Warmup:** 715 steps, followed by cosine decay
+- **Weight decay:** 0.1
+- **Gradient clipping:** 1.0
+- **Seed:** 42
+- **Compilation:** disabled for the production run
 
-this evaluation is somewhat outdated but still useful. openai also used this while evaluating gpt-3.
+The dataset was tokenized once and uploaded progressively to S3-compatible object storage. Every shard was reopened, checked as readable `uint16`, hashed, uploaded, remotely size-verified, and recorded in a manifest before the dataset `COMPLETE` marker was written.
 
-- it has a random score of 25% (meaning any model will get around 25% if it is just guessing). if our model is good, we should be able to gradually increase past this baseline.
+## Hardware
 
----
+Production training used exactly **one NVIDIA H100**. The completed checkpoint records 33,846.821 seconds of cumulative training time and an aggregate 295,441 tokens/s. At the observed batch rate of $0.045 per H100-minute, that corresponds to an estimated $25.39 of metered training compute.
+
+## Checkpoints and exact resume
+
+Checkpoints contain everything required to continue the same optimization trajectory:
+
+- model weights and optimizer state;
+- completed optimizer step and processed-token count;
+- data-loader shard and position state;
+- CPU and accelerator RNG state;
+- resolved configuration, Git SHA, and W&B run ID.
+
+Local checkpoints are written atomically. Cloud synchronization calculates SHA-256 locally, uploads with bounded retries, verifies remote size, publishes a checksum sidecar, and advances `LATEST.json` only after verification. Resume downloads retain a `.part` file, use ranged requests after interruption, verify size and SHA-256, and rename atomically before `torch.load`.
+
+The final checkpoint is:
+
+```text
+s3://gpt2-fineweb10b/training/gpt2-124m-fineweb10b-20260729t103500z-36bfc9e/checkpoints/final_step_019073.pt
+```
+
+- Size: `1,493,919,114` bytes
+- SHA-256: `e519d993d20c98c841ef061f76a1dec3e6ee24d5e55162bdea2a3e2da280fd40`
+- CPU `torch.load`: verified
+
+The object is retained in private project storage; the future Hugging Face release will provide the public model artifact.
+
+## Engineering failures and recovery
+
+The run completed through a sequence of infrastructure failures without restarting training from random initialization:
+
+1. The first tokenized dataset could not fit in the batch artifact channel. Dataset persistence moved to progressive S3 uploads with per-shard verification and a final manifest.
+2. Early dataset retries exposed runtime-image, tokenizer-resource, and workspace constraints. The final preparation path restored the original ordered FineWeb loader/tokenizer behavior and retained verified shards remotely.
+3. Training was healthy when a checkpoint synchronizer lost a response stream while rereading a large remote checkpoint. Verification was changed to local SHA-256 plus remote size/checksum-sidecar checks, eliminating unnecessary full-object rereads.
+4. Checkpoint uploads, pointer publication, and remote resume downloads gained bounded retry and resumable-transfer behavior. A transient sync failure could no longer immediately terminate healthy training.
+5. Continuation jobs restored the latest verified checkpoint—including optimizer, loader, RNG, processed-token count, and W&B identity—and resumed at `completed_step + 1`. The same run ultimately reached step 19,073 and published the final `COMPLETE` marker.
+
+This recovery design is why partial infrastructure failures cost runtime but did not discard learned state or change the training run identity.
+
+## Generated samples
+
+Fixed-seed examples were generated from the independently downloaded and verified final checkpoint. The full set and reproduction settings are in [generated_samples.md](results/generated_samples.md).
+
+**Prompt:** `The future of artificial intelligence is`
+
+> The future of artificial intelligence is also expanding. As artificial intelligence and its algorithms have increasingly grown, the field continues to rely heavily on human experts and computer vision researchers to guide its operations...
+
+**Prompt:** `To solve a difficult problem, first`
+
+> To solve a difficult problem, first evaluate the problem. A good method to help the system identify, solve, and resolve any problem is to first define “problems” using a given number concept...
+
+## Running locally
+
+Install the base and development dependencies:
+
+```bash
+python -m pip install -r requirements-dev.txt
+```
+
+Run the network-free CPU smoke test:
+
+```bash
+python train_gpt2.py --smoke-test --benchmark-steps 1
+```
+
+Run the production configuration against prepared local data:
+
+```bash
+python train_gpt2.py \
+  --config configs/gpt2_124m_fineweb10b.yaml \
+  --data-root /data/edu_fineweb10B \
+  --output-dir /outputs/gpt2-124m
+```
+
+Resume from a verified checkpoint:
+
+```bash
+python train_gpt2.py \
+  --config configs/gpt2_124m_fineweb10b.yaml \
+  --data-root /data/edu_fineweb10B \
+  --output-dir /outputs/gpt2-124m \
+  --resume /outputs/gpt2-124m/checkpoints/checkpoint_step_010000.pt
+```
+
+`torch.compile` is never enabled silently. Opt in with `--compile`, and benchmark it before a production run.
+
+## Limitations
+
+- This is a small, 124M-parameter base model trained for one approximately 10B-token pass; it is not competitive with modern large language models.
+- It is not instruction-tuned or aligned and should not be deployed as a chatbot.
+- Generated text can be incorrect, inconsistent, biased, unsafe, or copied in style from pretraining data.
+- HellaSwag accuracy is 30.03%, only modestly above the 25% random-choice baseline.
+- The committed scalar history covers the final continuation segment; the final checkpoint, final evaluation rows, and W&B history provide the authoritative terminal values.
+- The run did not include a comprehensive safety, bias, memorization, or downstream-task evaluation.
+- The checkpoint remains in private object storage until the separate Hugging Face publication step.
+
+## Reports
+
+- [Final training report](reports/training_report.md)
+- [Final metrics](results/final_metrics.json)
+- [Final checkpoint record](results/final_checkpoint.json)
+- [Repository audit](reports/repository_audit.md)
+- [Pretraining preparation summary](reports/pretraining_preparation_summary.md)

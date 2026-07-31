@@ -3,11 +3,11 @@ import datetime
 from contextlib import contextmanager
 
 class Logger:
-    def __init__(self, filename):
+    def __init__(self, filename, mode="a"):
         self.terminal = sys.stdout
         self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.filename = f"{filename}_{self.timestamp}.txt"
-        self.log = open(self.filename, 'w', encoding='utf-8')
+        self.log = open(self.filename, mode, encoding='utf-8')
 
     def write(self, message):
         self.terminal.write(message)
@@ -31,5 +31,3 @@ def capture_training_output(filename="training_log"):
     finally:
         sys.stdout = _stdout
         logger.close()
-
-sys.stdout = Logger("training_output")

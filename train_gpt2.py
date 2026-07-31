@@ -1,511 +1,1406 @@
-import math
-from dataclasses import dataclass
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import inspect
-import os
-import time
-import numpy as np
-from hellaswag import render_example, iterate_examples
+"""Train GPT-2 from random initialization on pre-tokenized FineWeb-Edu shards.
 
-class CasualSelfAttention(nn.Module):
-    def __init__(self, config):
+The module is intentionally import-safe: importing it never initializes DDP,
+downloads data, creates a model, or starts training.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import datetime as dt
+import inspect
+import json
+import math
+import os
+import random
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import uuid
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterator, Mapping, TextIO
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import yaml
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+CHECKPOINT_FORMAT_VERSION = 1
+DATASET_IDENTIFIER = "HuggingFaceFW/fineweb-edu:sample-10BT"
+CSV_FIELDS = [
+    "event",
+    "train_step",
+    "train_loss",
+    "learning_rate",
+    "gradient_norm",
+    "step_time_seconds",
+    "tokens_per_second",
+    "tokens_seen",
+    "elapsed_hours",
+    "estimated_training_cost",
+    "validation_loss",
+    "hellaswag_accuracy",
+    "hellaswag_correct",
+    "hellaswag_total",
+    "sample_prompt",
+    "generated_continuation",
+]
+
+
+class ConfigurationError(ValueError):
+    """Raised when resolved configuration is unsafe or inconsistent."""
+
+
+class CheckpointError(RuntimeError):
+    """Raised when a checkpoint is corrupt or incompatible."""
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config: "GPTConfig") -> None:
         super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, will split it later
-        # the k,q,v are of size (n_emdb, n_embd)
+        if config.n_embd % config.n_head:
+            raise ValueError("n_embd must be divisible by n_head")
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projectionenc = tiktoken.get_encoding("gpt2")
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        setattr(self.c_proj, 'NANOGPT_SCALE_INIT', torch.tensor(1))
-        # regularization
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
-        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2) # This line splits the concatenated qkv tensor into separate query, key and value tensors along dimension 2 (channel dimension)
-        # here multi head attention is done in a single casual self attention block
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        # attention (materializes the large (T,T) matrix for all the queries and keys)
-        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        #att = F.softmax(att, dim=-1)
-        #y = att @ v # (B, nh, T, T) * (B, nh, T, hs) -> (B, nh, T, hs)
-        # so the above 4 lines of code is simple attention but we want to use flash attention so that we can use the memory efficient version of the attention and use the meomory of our cuda device more greatly or efficiently
-        y = F.scaled_dot_product_attention(q, k, v,is_causal=True) # flash attention
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
-        y = self.c_proj(y)
-        return y
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, sequence, channels = x.size()
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        shape = (batch, sequence, self.n_head, channels // self.n_head)
+        q = q.view(shape).transpose(1, 2)
+        k = k.view(shape).transpose(1, 2)
+        v = v.view(shape).transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(batch, sequence, channels)
+        return self.c_proj(y)
 
+
+# Backward-compatible alias for the original misspelling.
+CasualSelfAttention = CausalSelfAttention
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
-            super().__init__()
-            self.c_fc = nn.Linear(config.n_embd,4 * config.n_embd)
-            self.gelu = nn.GELU(approximate='tanh')
-            self.c_proj = nn.Linear(4 * config.n_embd,config.n_embd)
-            # Use setattr to properly set custom attribute
-            setattr(self.c_proj, 'NANOGPT_SCALE_INIT', torch.tensor(1))
+    def __init__(self, config: "GPTConfig") -> None:
+        super().__init__()
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.gelu = nn.GELU(approximate="tanh")
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.c_proj(self.gelu(self.c_fc(x)))
+
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: "GPTConfig") -> None:
         super().__init__()
-        self.attn = CasualSelfAttention(config)
         self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        return x + self.mlp(self.ln_2(x))
+
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024 # max sequence length
-    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
-    n_layer: int = 12 # number of layers
-    n_head: int = 12 # number of heads
-    n_embd: int = 768 # embedding dimension
+    block_size: int = 1024
+    vocab_size: int = 50304
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
 
 
 class GPT(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.config = config
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
-        ))
+        self.transformer = nn.ModuleDict(
+            {
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "wpe": nn.Embedding(config.block_size, config.n_embd),
+                "h": nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                "ln_f": nn.LayerNorm(config.n_embd),
+            }
+        )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-        # weight sharing between the token embeddings and the final logit layer
         self.lm_head.weight = self.transformer.wte.weight
-
-        # init params
         self.apply(self._init_weights)
 
-    # mirroring the gpt2 initialisation by gpt2
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             std = 0.02
-            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
                 std *= (2 * self.config.n_layer) ** -0.5
-            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def forward(
+        self, idx: torch.Tensor, targets: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        _, sequence = idx.shape
+        if sequence > self.config.block_size:
+            raise ValueError(
+                f"sequence length {sequence} exceeds block size {self.config.block_size}"
+            )
+        positions = torch.arange(sequence, dtype=torch.long, device=idx.device)
+        x = self.transformer.wte(idx) + self.transformer.wpe(positions)
+        for block in self.transformer.h:
+            x = block(x)
+        logits = self.lm_head(self.transformer.ln_f(x))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
+            )
+        return logits, loss
 
-    def forward(self, idx, targets = None):
-            B,T = idx.shape # the input idx is always in the shape of (B,T)
-            assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-            pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-            wpe = self.transformer.wpe(pos)
-            wte = self.transformer.wte(idx)
-            x = wpe + wte
-            # making it go through all the blocks of the transformers
-            for block in self.transformer.h:
-                        x = block(x)
-            logits = self.lm_head(self.transformer.ln_f(x))
-            loss = None
-            if targets != None:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            return logits, loss
-
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-        return model
-
-    def configure_optimizers(self, weight_decay, learning_rate, device_type):
-        # start with all of the candidate parameters (that require grad)
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
+    def configure_optimizers(
+        self, weight_decay: float, learning_rate: float, device_type: str
+    ) -> torch.optim.Optimizer:
+        params = {name: value for name, value in self.named_parameters() if value.requires_grad}
+        decay = [value for value in params.values() if value.dim() >= 2]
+        no_decay = [value for value in params.values() if value.dim() < 2]
+        groups = [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        if master_process:
-                    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-                    print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        if master_process:
-                    print(f"using fused AdamW: {use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
-        return optimizer
-# -----------------------------------------------------------------------------
-# about datadistributeddata parallel
-# simple launch:
-# python train_gpt2.py
-# DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
-# run the training loop
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-# set up DDP (distributed data parallel).
-# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK']) # rank of current gpu
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE']) # total no of gpus
-    device = f'cuda:{ddp_local_rank}' #telling which gpu to use
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-else:
-    # normal run, without ddp
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-    # attempt to autodetect device
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"using device: {device}")
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        return torch.optim.AdamW(
+            groups,
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            fused=use_fused,
+        )
 
-device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-# -----------------------------------------------------------------------------
-import tiktoken
-def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32)
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
-# -----------------------------------------------------------------------------
+def count_parameters(model: nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def get_learning_rate(
+    step: int,
+    *,
+    warmup_steps: int,
+    max_steps: int,
+    max_learning_rate: float,
+    min_learning_rate: float,
+) -> float:
+    """Return LR for a zero-based optimizer step."""
+    if step < 0:
+        raise ValueError("step must be non-negative")
+    if warmup_steps < 0 or max_steps <= warmup_steps:
+        raise ValueError("require 0 <= warmup_steps < max_steps")
+    if step < warmup_steps:
+        return max_learning_rate * float(step + 1) / float(warmup_steps)
+    if step >= max_steps:
+        return min_learning_rate
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    coefficient = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_learning_rate + coefficient * (
+        max_learning_rate - min_learning_rate
+    )
+
+
+def get_lr(step: int) -> float:
+    """Compatibility wrapper using the production schedule."""
+    return get_learning_rate(
+        step,
+        warmup_steps=715,
+        max_steps=19073,
+        max_learning_rate=6e-4,
+        min_learning_rate=6e-5,
+    )
+
+
+def load_tokens(filename: str | Path) -> torch.Tensor:
+    array = np.load(filename).astype(np.int32)
+    return torch.tensor(array, dtype=torch.long)
+
+
 class DataLoaderLite:
+    """Deterministic DDP-aware sequential loader over token shards."""
 
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(
+        self,
+        B: int,
+        T: int,
+        process_rank: int,
+        num_processes: int,
+        split: str,
+        data_root: str | Path = "edu_fineweb10B",
+    ) -> None:
+        if split not in {"train", "val"}:
+            raise ValueError("split must be 'train' or 'val'")
+        if B <= 0 or T <= 0 or num_processes <= 0:
+            raise ValueError("B, T, and num_processes must be positive")
+        if not 0 <= process_rank < num_processes:
+            raise ValueError("process_rank must be within world size")
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
-
-        assert split in {'train', 'val'}
-        # get the shard filenames
-        data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
-        self.shards = shards
-        assert len(shards) > 0, f"no shards found for split {split}"
-        if master_process:
-            print(f"found {len(shards)} shards for split {split}")
+        self.split = split
+        self.data_root = Path(data_root)
+        self.shards = sorted(self.data_root.glob(f"*{split}*.npy"))
+        if not self.shards:
+            raise FileNotFoundError(
+                f"no {split} .npy shards found under {self.data_root.resolve()}"
+            )
+        self.current_shard = 0
+        self.tokens = torch.empty(0, dtype=torch.long)
+        self.current_position = 0
         self.reset()
 
-    def reset(self):
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
+    @property
+    def rank_offset(self) -> int:
+        return self.B * self.T * self.process_rank
 
-    def next_batch(self):
-        buf = self.tokens[self.current_position:self.current_position + self.B * self.T + 1]
-        x = buf[:-1].view(self.B, self.T)
-        y = buf[1:].view(self.B, self.T)
-        self.current_position += self.B * self.T * self.num_processes
-        # if loading the next batch would be out of bounds, reset
-        # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+    @property
+    def global_stride(self) -> int:
+        return self.B * self.T * self.num_processes
+
+    def _load_current_shard(self) -> None:
+        self.tokens = load_tokens(self.shards[self.current_shard])
+
+    def _has_complete_batch(self) -> bool:
+        # All ranks transition together. The final incomplete global range is
+        # skipped instead of letting ranks drift onto different shards.
+        rank_zero_position = self.current_position - self.rank_offset
+        return rank_zero_position + self.global_stride + 1 <= len(self.tokens)
+
+    def _advance_shard(self) -> None:
+        for _ in range(len(self.shards)):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
+            self._load_current_shard()
+            self.current_position = self.rank_offset
+            if self._has_complete_batch():
+                return
+        raise RuntimeError(
+                        "no shard is large enough for one rank-local batch; "
+            f"need at least {self.global_stride + 1} tokens"
+        )
+
+    def reset(self) -> None:
+        self.current_shard = 0
+        self._load_current_shard()
+        self.current_position = self.rank_offset
+        if not self._has_complete_batch():
+            self._advance_shard()
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._has_complete_batch():
+            self._advance_shard()
+        end = self.current_position + self.B * self.T + 1
+        buffer = self.tokens[self.current_position:end]
+        x = buffer[:-1].view(self.B, self.T)
+        y = buffer[1:].view(self.B, self.T)
+        self.current_position += self.global_stride
         return x, y
 
-# -----------------------------------------------------------------------------
-# helper function for HellaSwag eval
-# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
-def get_most_likely_row(tokens, mask, logits):
-    # evaluate the autoregressive loss at all positions
-    shift_logits = (logits[..., :-1, :]).contiguous()
-    shift_tokens = (tokens[..., 1:]).contiguous()
-    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_shift_tokens = shift_tokens.view(-1)
-    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-    shift_losses = shift_losses.view(tokens.size(0), -1)
-    # now get the average loss just for the completion region (where mask == 1), in each row
-    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-    masked_shift_losses = shift_losses * shift_mask
-    # sum and divide by the number of 1s in the mask
-    sum_loss = masked_shift_losses.sum(dim=1)
-    avg_loss = sum_loss / shift_mask.sum(dim=1)
-    # now we have a loss for each of the 4 completions
-    # the one with the lowest loss should be the most likely
-    pred_norm = avg_loss.argmin().item()
-    return pred_norm
+    def state_dict(self) -> dict[str, int]:
+        return {
+            "current_shard": self.current_shard,
+            "current_position": self.current_position,
+            "rank_zero_position": self.current_position - self.rank_offset,
+            "batch_size": self.B,
+            "sequence_length": self.T,
+            "num_processes": self.num_processes,
+        }
 
-# -----------------------------------------------------------------------------
-enc = tiktoken.get_encoding("gpt2")
-
-# add gradient accumulation steps
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 16 # micro batch size
-T = 1024 # sequence length
-assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-if master_process:
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
-
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
-torch.set_float32_matmul_precision('high') # use tensorfloat32 matmul
-
-model = GPT(GPTConfig(vocab_size=50304)) #using a no that is has a lots of powers of 2(just not using an ugly no lol1)
-model = model.to(device)
-use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
-if use_compile:
-    model = torch.compile(model) #when commented meaning -> sampling is there, when uncommented there is no sampling in the code
-
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
-
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-
-def get_lr(step):
-    #1 linear warmup for warmup_iters steps
-    if step < warmup_steps:
-        lr = max_lr * (step+1) / warmup_steps
-    #2 if it> kr_decay_iters, return the min lr
-    if step >  warmup_steps:
-        return min_lr
-    #3 in between use cosine decay down to min_lr
-    decay_ratio =(step - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <=1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
-
-# using optimizer with weight decay and lr
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        try:
+            shard = int(state["current_shard"])
+            rank_zero_position = int(
+                state.get("rank_zero_position", state["current_position"])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CheckpointError("invalid data-loader state") from exc
+        expected = {
+            "batch_size": self.B,
+            "sequence_length": self.T,
+            "num_processes": self.num_processes,
+        }
+        incompatible = {
+            key: (state.get(key), value)
+            for key, value in expected.items()
+            if key in state and int(state[key]) != value
+        }
+        if incompatible:
+            raise CheckpointError(
+                f"checkpoint data-loader configuration is incompatible: {incompatible}"
+            )
+        if not 0 <= shard < len(self.shards):
+            raise CheckpointError(f"checkpoint shard index {shard} is out of range")
+        if rank_zero_position < 0:
+            raise CheckpointError("checkpoint data-loader position is negative")
+        self.current_shard = shard
+        self._load_current_shard()
+        self.current_position = rank_zero_position + self.rank_offset
+        if self.current_position > len(self.tokens):
+            raise CheckpointError(
+                "checkpoint data-loader position lies beyond the shard"
+            )
 
 
-# create the log directory we will write checkpoints to and log to
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
+def _deep_merge(base: dict[str, Any], updates: Mapping[str, Any]) -> dict[str, Any]:
+    for key, value in updates.items():
+        if isinstance(value, Mapping) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
 
-# get logits and loss
-for step in range(max_steps):
-    t0 = time.time()
-    last_step = (step == max_steps - 1)
-    # once in a while evaluate our validation loss, there is no change in that
-    if step % 250 == 0 or last_step:
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
-        if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            print(f"validation loss: {val_loss_accum:.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum:.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config,
-                    'step': step,
-                    'val_loss': val_loss_accum
-                }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
-                torch.save(checkpoint, checkpoint_path)
-        # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
-        num_correct_norm = 0
-        num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:
-                continue
-            # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-            # get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            num_total += 1
-            num_correct_norm += int(pred_norm == label)
-        # reduce the stats across all processes
-        if ddp:
-            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-            num_total = num_total.item()
-            num_correct_norm = num_correct_norm.item()
-        acc_norm = num_correct_norm / num_total
-        if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm:.4f}\n")
-        # once in a while generate from the model (except step 0, which is noise)
-        if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
-            model.eval()
-            num_return_sequences = 4
-            max_length = 32
-            tokens = enc.encode("Hello, I'm a language model,")
-            tokens = torch.tensor(tokens, dtype=torch.long)
-            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-            xgen = tokens.to(device)
-            sample_rng = torch.Generator(device=device)
-            sample_rng.manual_seed(42 + ddp_rank)
-            while xgen.size(1) < max_length:
-                # forward the model to get the logits
-                with torch.no_grad():
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(xgen) # (B, T, vocab_size)
-                    # take the logits at the last position
-                    logits = logits[:, -1, :] # (B, vocab_size)
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    # do top-k sampling of 50 (huggingface pipeline default)
-                    # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                    # select a token from the top-k probabilities
-                    # note: multinomial does not demand the input to sum to 1
-                    ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                    # gather the corresponding indices
-                    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                    # append to the sequence
-                    xgen = torch.cat((xgen, xcol), dim=1)
-            # print the generated text
-            for i in range(num_return_sequences):
-                tokens = xgen[i, :max_length].tolist()
-                decoded = enc.decode(tokens)
-                print(f"rank {ddp_rank} sample {i}: {decoded}")
-    # training loop
-    model.train()
-    optimizer.zero_grad()
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        if ddp:
-            model.module.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)  # only sync on the last step
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        # we have to scale the loss to account for gradient accumulation,
-        # because the gradients just add on each successive backward().
-        # addition of gradients corresponds to a SUM in the objective, but
-        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
 
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        loss.backward()
+def validate_config(config: Mapping[str, Any]) -> None:
+    required_sections = {
+        "model",
+        "training",
+        "evaluation",
+        "checkpointing",
+        "logging",
+    }
+    missing = required_sections - set(config)
+    if missing:
+        raise ConfigurationError(f"missing configuration sections: {sorted(missing)}")
+    model = config["model"]
+    training = config["training"]
+    if model["block_size"] < training["sequence_length"]:
+        raise ConfigurationError("model.block_size must cover sequence_length")
+    if not 0 <= training["warmup_steps"] < training["max_steps"]:
+        raise ConfigurationError("require 0 <= warmup_steps < max_steps")
+    if training["min_learning_rate"] > training["max_learning_rate"]:
+        raise ConfigurationError("min_learning_rate cannot exceed max_learning_rate")
+    if training["precision"] not in {"float32", "bfloat16"}:
+        raise ConfigurationError("precision must be float32 or bfloat16")
+    positive_fields = [
+        ("training.max_steps", training["max_steps"]),
+        ("training.total_batch_size_tokens", training["total_batch_size_tokens"]),
+        ("training.micro_batch_size", training["micro_batch_size"]),
+        ("training.sequence_length", training["sequence_length"]),
+        ("evaluation.validation_interval", config["evaluation"]["validation_interval"]),
+        ("evaluation.validation_batches", config["evaluation"]["validation_batches"]),
+        ("evaluation.sample_interval", config["evaluation"]["sample_interval"]),
+        (
+            "evaluation.full_hellaswag_interval",
+            config["evaluation"]["full_hellaswag_interval"],
+        ),
+        ("checkpointing.interval", config["checkpointing"]["interval"]),
+        ("logging.scalar_interval", config["logging"]["scalar_interval"]),
+    ]
+    invalid = [name for name, value in positive_fields if int(value) <= 0]
+    if invalid:
+        raise ConfigurationError(f"configuration values must be positive: {invalid}")
+    denominator = training["micro_batch_size"] * training["sequence_length"]
+    if training["total_batch_size_tokens"] % denominator:
+        raise ConfigurationError(
+            "total_batch_size_tokens must be divisible by micro_batch_size * sequence_length"
+        )
+    if int(config["checkpointing"]["keep_last"]) < 0:
+        raise ConfigurationError("checkpointing.keep_last cannot be negative")
+    if config["logging"].get("histogram_mode", "disabled") not in {
+        "disabled",
+        "debug_gradients",
+    }:
+        raise ConfigurationError(
+            "logging.histogram_mode must be disabled or debug_gradients"
+        )
+
+
+def load_config(path: str | Path, overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise ConfigurationError("configuration root must be a mapping")
+    if overrides:
+        _deep_merge(config, overrides)
+    validate_config(config)
+    return config
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config", default="configs/gpt2_124m_fineweb10b.yaml", type=Path
+    )
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--compile", action="store_true", dest="compile_model")
+    parser.add_argument(
+        "--wandb-mode", choices=("disabled", "offline", "online")
+    )
+    parser.add_argument("--wandb-project")
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-run-name")
+    parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--benchmark-steps", type=int)
+    parser.add_argument("--checkpoint-interval", type=int)
+    parser.add_argument("--hellaswag-interval", type=int)
+    parser.add_argument(
+        "--max-runtime-seconds",
+        type=int,
+        help="gracefully checkpoint and pause after this much training-loop wall time",
+    )
+    return parser
+
+
+def cli_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
+
+    def put(section: str, key: str, value: Any) -> None:
+        if value is not None:
+            overrides.setdefault(section, {})[key] = value
+
+    put("paths", "data_root", str(args.data_root) if args.data_root else None)
+    put("paths", "output_dir", str(args.output_dir) if args.output_dir else None)
+    put("training", "max_steps", args.max_steps)
+    put("training", "seed", args.seed)
+    if args.compile_model:
+        put("training", "compile", True)
+    put("logging", "wandb_mode", args.wandb_mode)
+    put("logging", "wandb_project", args.wandb_project)
+    put("logging", "wandb_entity", args.wandb_entity)
+    put("logging", "wandb_run_name", args.wandb_run_name)
+    put("checkpointing", "interval", args.checkpoint_interval)
+    put("evaluation", "full_hellaswag_interval", args.hellaswag_interval)
+    return overrides
+
+
+def parse_config(argv: list[str] | None = None) -> tuple[argparse.Namespace, dict[str, Any]]:
+    args = build_parser().parse_args(argv)
+    config_path = (
+        Path("configs/smoke_test.yaml") if args.smoke_test else args.config
+    )
+    config = load_config(config_path, cli_overrides(args))
+    return args, config
+
+
+def atomic_torch_save(payload: Mapping[str, Any], path: str | Path) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f".{destination.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            torch.save(dict(payload), handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, destination)
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name)
+        raise
+
+
+def capture_rng_state() -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "cpu": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["cpu"].cpu())
+        if torch.cuda.is_available() and state.get("cuda"):
+            torch.cuda.set_rng_state_all(
+                [device_state.cpu() for device_state in state["cuda"]]
+            )
+    except (KeyError, TypeError, RuntimeError, ValueError) as exc:
+        raise CheckpointError("checkpoint contains invalid RNG state") from exc
+
+
+def git_commit_sha() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return os.environ.get("GMN_SOURCE_GIT_SHA", "unknown")
+
+
+def checkpoint_payload(
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    completed_step: int,
+    config: Mapping[str, Any],
+    train_loss: float,
+    validation_loss: float | None,
+    train_loader: DataLoaderLite,
+    tokens_processed: int,
+    elapsed_wall_time: float,
+    wandb_run_id: str | None,
+    git_sha: str,
+    per_rank_states: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "completed_step": completed_step,
+        "config": dict(config),
+        "train_loss": train_loss,
+        "validation_loss": validation_loss,
+        "data_loader": train_loader.state_dict(),
+        "current_shard": train_loader.current_shard,
+        "current_position": train_loader.current_position,
+        "rng_state": capture_rng_state(),
+        "tokens_processed": tokens_processed,
+        "elapsed_wall_time": elapsed_wall_time,
+        "wandb_run_id": wandb_run_id,
+        "git_commit_sha": git_sha,
+        "model_parameter_count": count_parameters(model),
+        "per_rank_states": per_rank_states,
+    }
+
+
+def load_checkpoint(
+    path: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    train_loader: DataLoaderLite,
+    map_location: str | torch.device = "cpu",
+    restore_rng: bool = True,
+    rank: int = 0,
+) -> dict[str, Any]:
+    checkpoint_path = Path(path)
+    try:
+        try:
+            payload = torch.load(
+                checkpoint_path, map_location=map_location, weights_only=False
+            )
+        except TypeError:
+            payload = torch.load(checkpoint_path, map_location=map_location)
+    except Exception as exc:
+        raise CheckpointError(f"cannot read checkpoint {checkpoint_path}: {exc}") from exc
+    required = {
+        "checkpoint_format_version",
+        "model",
+        "optimizer",
+        "completed_step",
+        "config",
+        "data_loader",
+        "rng_state",
+    }
+    if not isinstance(payload, dict):
+        raise CheckpointError("checkpoint root must be a mapping")
+    missing = required - set(payload)
+    if missing:
+        raise CheckpointError(f"checkpoint is missing required fields: {sorted(missing)}")
+    if payload["checkpoint_format_version"] != CHECKPOINT_FORMAT_VERSION:
+        raise CheckpointError(
+            "unsupported checkpoint format version "
+            f"{payload['checkpoint_format_version']}; expected {CHECKPOINT_FORMAT_VERSION}"
+        )
+    try:
+        model.load_state_dict(payload["model"])
+        optimizer.load_state_dict(payload["optimizer"])
+        rank_states = payload.get("per_rank_states")
+        selected_state = (
+            rank_states[rank]
+            if rank_states and 0 <= rank < len(rank_states)
+            else {
+                "data_loader": payload["data_loader"],
+                "rng_state": payload["rng_state"],
+            }
+        )
+        train_loader.load_state_dict(selected_state["data_loader"])
+    except Exception as exc:
+        raise CheckpointError(f"checkpoint is incompatible: {exc}") from exc
+    if restore_rng:
+        restore_rng_state(selected_state["rng_state"])
+    payload["next_step"] = int(payload["completed_step"]) + 1
+    return payload
+
+
+def prune_rolling_checkpoints(
+    directory: str | Path, *, keep_last: int, protected_steps: set[int]
+) -> None:
+    paths = sorted(Path(directory).glob("checkpoint_step_*.pt"))
+    rolling = []
+    for path in paths:
+        try:
+            step = int(path.stem.rsplit("_", 1)[1])
+        except ValueError:
+            continue
+        if step not in protected_steps:
+            rolling.append(path)
+    for old_path in rolling[:-keep_last] if keep_last else rolling:
+        old_path.unlink()
+
+
+def collect_rank_states(
+    loader: DataLoaderLite, *, ddp: bool, world_size: int
+) -> list[dict[str, Any]]:
+    local_state = {
+        "data_loader": loader.state_dict(),
+        "rng_state": capture_rng_state(),
+    }
+    if not ddp:
+        return [local_state]
+    gathered: list[dict[str, Any] | None] = [None] * world_size
+    dist.all_gather_object(gathered, local_state)
+    return [state for state in gathered if state is not None]
+
+
+class CSVMetricLogger:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(self, event: str, **metrics: Any) -> None:
+        exists = self.path.exists() and self.path.stat().st_size > 0
+        row = {field: "" for field in CSV_FIELDS}
+        row["event"] = event
+        for key, value in metrics.items():
+            if key in row:
+                row[key] = value
+        with self.path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+            if not exists:
+                writer.writeheader()
+            writer.writerow(row)
+            handle.flush()
+
+
+class Tee:
+    def __init__(self, stream: TextIO, log: TextIO) -> None:
+        self.stream = stream
+        self.log = log
+
+    def write(self, text: str) -> int:
+        self.stream.write(text)
+        written = self.log.write(text)
+        self.flush()
+        return written
+
+    def flush(self) -> None:
+        self.stream.flush()
+        self.log.flush()
+
+    def isatty(self) -> bool:
+        return self.stream.isatty()
+
+
+@contextlib.contextmanager
+def tee_output(path: str | Path) -> Iterator[None]:
+    log_path = Path(path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = Tee(old_stdout, log), Tee(old_stderr, log)
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
+class WandbLogger:
+    """Failure-tolerant W&B adapter; every metric is logged locally separately."""
+
+    def __init__(self, mode: str, master_process: bool) -> None:
+        self.mode = mode
+        self.master_process = master_process
+        self.run: Any = None
+        self.run_id: str | None = None
+        self._failed = False
+
+    def initialize(
+        self,
+        *,
+        project: str,
+        entity: str | None,
+        name: str | None,
+        run_id: str,
+        config: Mapping[str, Any],
+        model: nn.Module | None = None,
+        histogram_mode: str = "disabled",
+    ) -> None:
+        self.run_id = run_id
+        if not self.master_process or self.mode == "disabled":
+            return
+        try:
+            import wandb
+
+            self.run = wandb.init(
+                project=project,
+                entity=entity,
+                name=name,
+                id=run_id,
+                resume="allow",
+                mode=self.mode,
+                config=dict(config),
+            )
+            if histogram_mode == "debug_gradients" and model is not None:
+                wandb.watch(model, log="gradients", log_freq=10)
+        except Exception as exc:
+            self._failed = True
+            if self.mode == "online":
+                raise RuntimeError(
+                    "W&B online initialization failed; refusing to train without monitoring"
+                ) from exc
+            print(f"warning: W&B initialization failed; continuing locally: {exc}")
+
+    def log(self, metrics: Mapping[str, Any], step: int) -> None:
+        if self.run is None or self._failed:
+            return
+        try:
+            self.run.log(dict(metrics), step=step)
+        except Exception as exc:
+            self._failed = True
+            print(f"warning: W&B logging failed; continuing locally: {exc}")
+
+    def finish(self, exit_code: int = 0) -> None:
+        if self.run is not None:
+            with contextlib.suppress(Exception):
+                self.run.finish(exit_code=exit_code)
+
+
+def autocast_context(device_type: str, precision: str) -> contextlib.AbstractContextManager:
+    if device_type == "cuda" and precision == "bfloat16":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+@torch.no_grad()
+def generate_text(
+    model: nn.Module,
+    *,
+    prompt: str,
+    device: torch.device,
+    max_length: int,
+    seed: int,
+) -> str:
+    import tiktoken
+
+    tokenizer = tiktoken.get_encoding("gpt2")
+    tokens = tokenizer.encode(prompt)
+    x = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    was_training = model.training
+    model.eval()
+    try:
+        while x.size(1) < max_length:
+            logits, _ = model(x[:, -getattr(model, "config").block_size :])
+            probabilities = F.softmax(logits[:, -1, :], dim=-1)
+            topk_probabilities, topk_indices = torch.topk(
+                probabilities, min(50, probabilities.size(-1)), dim=-1
+            )
+            chosen = torch.multinomial(topk_probabilities, 1, generator=generator)
+            x = torch.cat((x, torch.gather(topk_indices, -1, chosen)), dim=1)
+    finally:
+        model.train(was_training)
+    return tokenizer.decode(x[0].tolist())
+
+
+def write_sample(path: str | Path, step: int, prompt: str, continuation: str) -> None:
+    sample_path = Path(path)
+    sample_path.parent.mkdir(parents=True, exist_ok=True)
+    with sample_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n## Step {step}\n\n**Prompt:** {prompt}\n\n{continuation}\n")
+
+
+def write_run_status(path: str | Path, **values: Any) -> None:
+    status_path = Path(path)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = status_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(values, indent=2, default=str) + "\n", encoding="utf-8")
+    os.replace(temporary, status_path)
+
+
+def prepare_smoke_data(data_root: str | Path) -> None:
+    """Create deterministic, tiny local shards; never touches the network."""
+    root = Path(data_root)
+    root.mkdir(parents=True, exist_ok=True)
+    train_path = root / "synthetic_train_000000.npy"
+    val_path = root / "synthetic_val_000000.npy"
+    if not train_path.exists():
+        np.save(train_path, np.arange(1024, dtype=np.uint16) % 64)
+    if not val_path.exists():
+        np.save(val_path, np.arange(256, dtype=np.uint16) % 64)
+
+
+def _setup_distributed() -> tuple[bool, int, int, int, torch.device]:
+    ddp = int(os.environ.get("RANK", "-1")) >= 0
     if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    if device_type == 'cuda':
-        torch.cuda.synchronize() # wait for the computation to be done
-    t1 = time.time()
-    dt = t1 - t0 # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-    tokens_per_sec = tokens_processed / dt
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP training requires CUDA")
+        init_process_group(backend="nccl")
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+        return True, rank, local_rank, world_size, device
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    return False, 0, 0, 1, device
 
-    if master_process:
-        print(f"step {step:5d} | loss: {loss_accum:.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum:.6f}\n")
-if ddp:
-    destroy_process_group()
 
-# -----------------------------------------------------------------------------
+def _validation_loss(
+    model: nn.Module,
+    loader: DataLoaderLite,
+    *,
+    batches: int,
+    device: torch.device,
+    device_type: str,
+    precision: str,
+    ddp: bool,
+) -> float:
+    model.eval()
+    loader.reset()
+    accumulated = torch.zeros((), device=device)
+    with torch.no_grad():
+        for _ in range(batches):
+            x, y = loader.next_batch()
+            with autocast_context(device_type, precision):
+                _, loss = model(x.to(device), y.to(device))
+            assert loss is not None
+            accumulated += loss.detach() / batches
+    if ddp:
+        dist.all_reduce(accumulated, op=dist.ReduceOp.AVG)
+    return float(accumulated.item())
+
+
+def _hellaswag(
+    model: nn.Module,
+    *,
+    data_root: Path,
+    device: torch.device,
+    device_type: str,
+    precision: str,
+    rank: int,
+    world_size: int,
+    ddp: bool,
+) -> tuple[float, int, int]:
+    from hellaswag import iterate_examples, render_example
+
+    model.eval()
+    correct = 0
+    total = 0
+    for index, example in enumerate(
+        iterate_examples("val", data_root=data_root, allow_download=False)
+    ):
+        if index % world_size != rank:
+            continue
+        _, tokens, mask, label = render_example(example)
+        tokens, mask = tokens.to(device), mask.to(device)
+        with torch.no_grad(), autocast_context(device_type, precision):
+            logits, _ = model(tokens)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_tokens = tokens[..., 1:].contiguous()
+        losses = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_tokens.view(-1),
+            reduction="none",
+        ).view(tokens.size(0), -1)
+        shifted_mask = mask[..., 1:].contiguous()
+        average = (losses * shifted_mask).sum(1) / shifted_mask.sum(1)
+        correct += int(average.argmin().item() == label)
+        total += 1
+    if ddp:
+        values = torch.tensor([correct, total], dtype=torch.long, device=device)
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        correct, total = map(int, values.tolist())
+    return correct / total, correct, total
+
+
+def train(args: argparse.Namespace, config: dict[str, Any]) -> None:
+    paths = config.get("paths", {})
+    data_root = Path(paths.get("data_root", "edu_fineweb10B"))
+    output_dir = Path(paths.get("output_dir", "outputs/gpt2_124m_fineweb10b"))
+    training = config["training"]
+    evaluation = config["evaluation"]
+    checkpointing = config["checkpointing"]
+    logging_config = config["logging"]
+    if (
+        logging_config.get("wandb_mode") == "online"
+        and not os.environ.get("WANDB_API_KEY")
+    ):
+        raise ConfigurationError(
+            "WANDB_API_KEY is required when logging.wandb_mode is online"
+        )
+    if args.max_runtime_seconds is not None and args.max_runtime_seconds <= 0:
+        raise ConfigurationError("--max-runtime-seconds must be positive")
+    for split in ("train", "val"):
+        if not any(data_root.glob(f"*{split}*.npy")):
+            raise FileNotFoundError(
+                f"no {split} .npy shards found under {data_root.resolve()}"
+            )
+    hellaswag_root = Path(paths.get("hellaswag_root", "hellaswag"))
+    if (
+        args.benchmark_steps is None
+        and (
+            evaluation["full_hellaswag_at_end"]
+            or training["max_steps"] >= evaluation["full_hellaswag_interval"]
+        )
+        and not (hellaswag_root / "hellaswag_val.jsonl").is_file()
+    ):
+        raise FileNotFoundError(
+            f"HellaSwag validation data is missing under {hellaswag_root.resolve()}; "
+            "download it before allocating paid training compute"
+        )
+    ddp, rank, local_rank, world_size, device = _setup_distributed()
+    master = rank == 0
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    logs_dir = output_dir / "logs"
+    results_dir = output_dir / "results"
+    checkpoints_dir = output_dir / "checkpoints"
+    log_path = logs_dir / "train.log"
+    history = CSVMetricLogger(results_dir / "training_history.csv")
+    status_path = results_dir / "run_status.json"
+    samples_path = results_dir / "generated_samples.md"
+    seed = int(training["seed"]) + rank
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+    torch.set_float32_matmul_precision("high")
+
+    denominator = (
+        training["micro_batch_size"] * training["sequence_length"] * world_size
+    )
+    if training["total_batch_size_tokens"] % denominator:
+        raise ConfigurationError(
+            "total_batch_size_tokens must be divisible by micro batch tokens * DDP world size"
+        )
+    accumulation_steps = training["total_batch_size_tokens"] // denominator
+    train_loader = DataLoaderLite(
+        B=training["micro_batch_size"],
+        T=training["sequence_length"],
+        process_rank=rank,
+        num_processes=world_size,
+        split="train",
+        data_root=data_root,
+    )
+    val_loader = DataLoaderLite(
+        B=training["micro_batch_size"],
+        T=training["sequence_length"],
+        process_rank=rank,
+        num_processes=world_size,
+        split="val",
+        data_root=data_root,
+    )
+    raw_model = GPT(GPTConfig(**config["model"])).to(device)
+    optimizer = raw_model.configure_optimizers(
+        training["weight_decay"], training["max_learning_rate"], device_type
+    )
+    start_step = 1
+    tokens_seen = 0
+    elapsed_before = 0.0
+    latest_validation: float | None = None
+    run_id = uuid.uuid4().hex
+    original_git_sha = git_commit_sha()
+    if args.resume:
+        resumed = load_checkpoint(
+            args.resume,
+            model=raw_model,
+            optimizer=optimizer,
+            train_loader=train_loader,
+            map_location=device,
+            rank=rank,
+        )
+        start_step = resumed["next_step"]
+        tokens_seen = int(resumed.get("tokens_processed", 0))
+        elapsed_before = float(resumed.get("elapsed_wall_time", 0.0))
+        latest_validation = resumed.get("validation_loss")
+        run_id = resumed.get("wandb_run_id") or run_id
+        original_git_sha = resumed.get("git_commit_sha", original_git_sha)
+    if training.get("compile", False):
+        raw_model_for_checkpoint = raw_model
+        training_model: nn.Module = torch.compile(raw_model)
+    else:
+        raw_model_for_checkpoint = raw_model
+        training_model = raw_model
+    if ddp:
+        training_model = DDP(training_model, device_ids=[local_rank])
+
+    metadata = {
+        "resolved_config": config,
+        "dataset_identifier": DATASET_IDENTIFIER,
+        "original_git_sha": original_git_sha,
+        "training_git_sha": git_commit_sha(),
+        "pytorch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "gpu_model": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+        "ddp_world_size": world_size,
+        "precision": training["precision"],
+        "givemeanode_job_id": os.environ.get("GIVEMEANODE_JOB_ID"),
+        "planned_spending_limit": os.environ.get("PLANNED_SPENDING_LIMIT"),
+    }
+    wandb_logger = WandbLogger(logging_config.get("wandb_mode", "disabled"), master)
+    started = time.monotonic()
+    runtime_deadline = (
+        started + args.max_runtime_seconds
+        if args.max_runtime_seconds is not None
+        else None
+    )
+    exit_code = 1
+    state = "running"
+    paused = False
+    final_step = start_step - 1
+    benchmark_steps = args.benchmark_steps
+    stop_step = training["max_steps"]
+    if benchmark_steps is not None:
+        if benchmark_steps <= 0:
+            raise ConfigurationError("--benchmark-steps must be positive")
+        stop_step = min(stop_step, start_step + benchmark_steps - 1)
+    if start_step > stop_step:
+        raise ConfigurationError(
+            f"resume would start at step {start_step}, beyond configured stop step {stop_step}"
+        )
+    last_validation_step: int | None = None
+    last_hellaswag_step: int | None = None
+    if master:
+        write_run_status(
+            status_path,
+            status=state,
+            started_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            start_step=start_step,
+            planned_final_step=stop_step,
+            wandb_run_id=run_id,
+        )
+    try:
+        with tee_output(log_path) if master else contextlib.nullcontext():
+            wandb_logger.initialize(
+                project=logging_config["wandb_project"],
+                entity=logging_config.get("wandb_entity"),
+                name=logging_config.get("wandb_run_name"),
+                run_id=run_id,
+                config=metadata,
+                model=raw_model_for_checkpoint,
+                histogram_mode=logging_config.get("histogram_mode", "disabled"),
+            )
+            print(
+                f"device={device} world_size={world_size} accumulation_steps={accumulation_steps} "
+                f"parameters={count_parameters(raw_model_for_checkpoint):,}"
+            )
+            for step in range(start_step, stop_step + 1):
+                step_started = time.monotonic()
+                final_step = step
+                training_model.train()
+                optimizer.zero_grad(set_to_none=True)
+                accumulated_loss = torch.zeros((), device=device)
+                for micro_step in range(accumulation_steps):
+                    x, y = train_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    if ddp:
+                        training_model.require_backward_grad_sync = (
+                            micro_step == accumulation_steps - 1
+                        )
+                    with autocast_context(device_type, training["precision"]):
+                        _, loss = training_model(x, y)
+                    assert loss is not None
+                    scaled_loss = loss / accumulation_steps
+                    accumulated_loss += scaled_loss.detach()
+                    scaled_loss.backward()
+                if ddp:
+                    dist.all_reduce(accumulated_loss, op=dist.ReduceOp.AVG)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    training_model.parameters(), training["gradient_clip"]
+                )
+                learning_rate = get_learning_rate(
+                    step - 1,
+                    warmup_steps=training["warmup_steps"],
+                    max_steps=training["max_steps"],
+                    max_learning_rate=training["max_learning_rate"],
+                    min_learning_rate=training["min_learning_rate"],
+                )
+                for group in optimizer.param_groups:
+                    group["lr"] = learning_rate
+                optimizer.step()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                step_seconds = time.monotonic() - step_started
+                tokens_seen += training["total_batch_size_tokens"]
+                elapsed = elapsed_before + time.monotonic() - started
+                hourly_rate = os.environ.get("GPU_HOURLY_RATE")
+                estimated_cost = (
+                    elapsed / 3600 * float(hourly_rate) if hourly_rate else None
+                )
+                metrics = {
+                    "train_step": step,
+                    "train_loss": float(accumulated_loss.item()),
+                    "learning_rate": learning_rate,
+                    "gradient_norm": float(gradient_norm),
+                    "step_time_seconds": step_seconds,
+                    "tokens_per_second": training["total_batch_size_tokens"] / step_seconds,
+                    "tokens_seen": tokens_seen,
+                    "elapsed_hours": elapsed / 3600,
+                    "estimated_training_cost": estimated_cost,
+                }
+                if master and step % logging_config["scalar_interval"] == 0:
+                    print(
+                        f"step {step:5d} loss={metrics['train_loss']:.6f} "
+                        f"lr={learning_rate:.4e} norm={float(gradient_norm):.4f} "
+                        f"tok/s={metrics['tokens_per_second']:.0f}"
+                    )
+                    history.log("train", **metrics)
+                    wandb_logger.log(metrics, step)
+
+                validation_due = step % evaluation["validation_interval"] == 0
+                if validation_due:
+                    latest_validation = _validation_loss(
+                        training_model,
+                        val_loader,
+                        batches=evaluation["validation_batches"],
+                        device=device,
+                        device_type=device_type,
+                        precision=training["precision"],
+                        ddp=ddp,
+                    )
+                    if master:
+                        history.log(
+                            "validation",
+                            train_step=step,
+                            validation_loss=latest_validation,
+                        )
+                        wandb_logger.log(
+                            {"validation_loss": latest_validation}, step
+                        )
+                    last_validation_step = step
+
+                if (
+                    benchmark_steps is None
+                    and step % evaluation["full_hellaswag_interval"] == 0
+                ):
+                    accuracy, correct, total = _hellaswag(
+                        training_model,
+                        data_root=Path(paths.get("hellaswag_root", "hellaswag")),
+                        device=device,
+                        device_type=device_type,
+                        precision=training["precision"],
+                        rank=rank,
+                        world_size=world_size,
+                        ddp=ddp,
+                    )
+                    if master:
+                        hella_metrics = {
+                            "hellaswag_accuracy": accuracy,
+                            "hellaswag_correct": correct,
+                            "hellaswag_total": total,
+                        }
+                        history.log("hellaswag", train_step=step, **hella_metrics)
+                        wandb_logger.log(hella_metrics, step)
+                    last_hellaswag_step = step
+
+                if (
+                    benchmark_steps is None
+                    and step % evaluation["sample_interval"] == 0
+                    and master
+                ):
+                    prompt = logging_config.get(
+                        "sample_prompt", "Hello, I'm a language model,"
+                    )
+                    continuation = generate_text(
+                        raw_model_for_checkpoint,
+                        prompt=prompt,
+                        device=device,
+                        max_length=logging_config.get("sample_max_length", 64),
+                        seed=training["seed"] + step,
+                    )
+                    write_sample(samples_path, step, prompt, continuation)
+                    history.log(
+                        "sample",
+                        train_step=step,
+                        sample_prompt=prompt,
+                        generated_continuation=continuation,
+                    )
+                    wandb_logger.log(
+                        {"sample_step": step, "prompt": prompt, "generated_continuation": continuation},
+                        step,
+                    )
+
+                checkpoint_due = step % checkpointing["interval"] == 0
+                if checkpoint_due:
+                    rank_states = collect_rank_states(
+                        train_loader, ddp=ddp, world_size=world_size
+                    )
+                    if master:
+                        payload = checkpoint_payload(
+                            model=raw_model_for_checkpoint,
+                            optimizer=optimizer,
+                            completed_step=step,
+                            config=config,
+                            train_loss=float(accumulated_loss.item()),
+                            validation_loss=latest_validation,
+                            train_loader=train_loader,
+                            tokens_processed=tokens_seen,
+                            elapsed_wall_time=elapsed,
+                            wandb_run_id=run_id,
+                            git_sha=original_git_sha,
+                            per_rank_states=rank_states,
+                        )
+                        atomic_torch_save(
+                            payload, checkpoints_dir / f"checkpoint_step_{step:06d}.pt"
+                        )
+                        prune_rolling_checkpoints(
+                            checkpoints_dir,
+                            keep_last=checkpointing["keep_last"],
+                            protected_steps=set(checkpointing["milestone_steps"]),
+                        )
+                if runtime_deadline is not None and time.monotonic() >= runtime_deadline:
+                    paused = True
+                    if master:
+                        print(
+                            f"training runtime budget reached after step {step}; "
+                            "writing a resumable checkpoint"
+                        )
+                    break
+
+            # Benchmarks intentionally skip expensive final evaluation.
+            if benchmark_steps is None and not paused:
+                if last_validation_step != final_step:
+                    latest_validation = _validation_loss(
+                        training_model,
+                        val_loader,
+                        batches=evaluation["validation_batches"],
+                        device=device,
+                        device_type=device_type,
+                        precision=training["precision"],
+                        ddp=ddp,
+                    )
+                    if master:
+                        history.log(
+                            "validation",
+                            train_step=final_step,
+                            validation_loss=latest_validation,
+                        )
+                        wandb_logger.log(
+                            {"validation_loss": latest_validation}, final_step
+                        )
+                if (
+                    evaluation["full_hellaswag_at_end"]
+                    and last_hellaswag_step != final_step
+                ):
+                    accuracy, correct, total = _hellaswag(
+                        training_model,
+                        data_root=Path(paths.get("hellaswag_root", "hellaswag")),
+                        device=device,
+                        device_type=device_type,
+                        precision=training["precision"],
+                        rank=rank,
+                        world_size=world_size,
+                        ddp=ddp,
+                    )
+                    if master:
+                        final_hella_metrics = {
+                            "hellaswag_accuracy": accuracy,
+                            "hellaswag_correct": correct,
+                            "hellaswag_total": total,
+                        }
+                        history.log(
+                            "hellaswag",
+                            train_step=final_step,
+                            **final_hella_metrics,
+                        )
+                        wandb_logger.log(final_hella_metrics, final_step)
+            final_rank_states = collect_rank_states(
+                train_loader, ddp=ddp, world_size=world_size
+            )
+            if master:
+                elapsed = elapsed_before + time.monotonic() - started
+                payload = checkpoint_payload(
+                    model=raw_model_for_checkpoint,
+                    optimizer=optimizer,
+                    completed_step=final_step,
+                    config=config,
+                    train_loss=float(accumulated_loss.item()),
+                    validation_loss=latest_validation,
+                    train_loader=train_loader,
+                    tokens_processed=tokens_seen,
+                    elapsed_wall_time=elapsed,
+                    wandb_run_id=run_id,
+                    git_sha=original_git_sha,
+                    per_rank_states=final_rank_states,
+                )
+                final_path = checkpoints_dir / f"final_step_{final_step:06d}.pt"
+                if final_path.exists():
+                    raise FileExistsError(f"refusing to overwrite final checkpoint {final_path}")
+                atomic_torch_save(payload, final_path)
+            state = "paused" if paused else "completed"
+            exit_code = 0
+    except BaseException:
+        state = "error"
+        raise
+    finally:
+        if master:
+            write_run_status(
+                status_path,
+                status=state,
+                final_step=final_step,
+                tokens_seen=tokens_seen,
+                elapsed_wall_time=elapsed_before + time.monotonic() - started,
+                finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                wandb_run_id=run_id,
+            )
+        wandb_logger.finish(exit_code)
+        if ddp:
+            destroy_process_group()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args, config = parse_config(argv)
+    output_dir = Path(
+        config.get("paths", {}).get("output_dir", "outputs/gpt2_124m_fineweb10b")
+    )
+    try:
+        if args.smoke_test:
+            prepare_smoke_data(config["paths"]["data_root"])
+        train(args, config)
+        return 0
+    except Exception as exc:
+        log_path = output_dir / "logs" / "train.log"
+        with tee_output(log_path):
+            traceback.print_exc()
+        write_run_status(
+            output_dir / "results" / "run_status.json",
+            status="error",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,47 @@
+paths:
+  data_root: tests/fixtures/synthetic_fineweb
+  hellaswag_root: tests/fixtures/hellaswag
+  output_dir: outputs/smoke_test
+
+model:
+  block_size: 8
+  vocab_size: 64
+  n_layer: 2
+  n_head: 2
+  n_embd: 16
+
+training:
+  total_batch_size_tokens: 16
+  micro_batch_size: 2
+  sequence_length: 8
+  max_steps: 2
+  max_learning_rate: 0.001
+  min_learning_rate: 0.0001
+  warmup_steps: 1
+  weight_decay: 0.1
+  gradient_clip: 1.0
+  precision: float32
+  seed: 42
+  compile: false
+
+evaluation:
+  validation_interval: 1
+  validation_batches: 1
+  sample_interval: 1000
+  full_hellaswag_interval: 5000
+  full_hellaswag_at_end: false
+
+checkpointing:
+  interval: 1
+  keep_last: 1
+  milestone_steps:
+    - 2
+
+logging:
+  scalar_interval: 1
+  wandb_project: gpt2-smoke-test
+  wandb_mode: disabled
+  wandb_watch: disabled
+  histogram_mode: disabled
+  sample_prompt: "test"
+  sample_max_length: 8
