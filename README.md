@@ -26,6 +26,15 @@ The completed [Weights & Biases run](https://wandb.ai/ctxnn-thapar-university/gp
 
 **Live demo:** [Open the GPT-2 124M Gradio Space](https://huggingface.co/spaces/ctxnn1/gpt2-from-scratch-demo) (free, CPU-basic)
 
+## HellaSwag comparison
+
+| Model | HellaSwag accuracy | Difference |
+|---|---:|---:|
+| Released OpenAI GPT-2 124M checkpoint | 29.4% | baseline |
+| This FineWeb-Edu 10B run | **30.0339%** (3,016 / 10,042) | **+0.6339 percentage points** |
+
+Our model scores approximately **2.16% higher relative to the 29.4% baseline**. The reference score is Karpathy's evaluation of the released OpenAI GPT-2 124M checkpoint, not a metric reported in OpenAI's original 2019 paper; see the [llm.c GPT-2 reproduction](https://github.com/karpathy/llm.c/discussions/481). This is a descriptive comparison under a closely aligned zero-shot, normalized-completion evaluation. The training datasets differ (FineWeb-Edu versus WebText), and the baseline is rounded to one decimal place.
+
 ## Training curves
 
 The committed history contains the final continuation segment rather than every earlier scalar row. Continuous plots therefore label their observed step range explicitly; final metrics come from the verified step-19,073 checkpoint and final evaluation records.
