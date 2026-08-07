@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "training_run_id": "gpt2-124m-fineweb10b-20260729t103500z-36bfc9e",
+  "status": "complete_verified",
+  "final_step": 19073,
+  "total_tokens_processed": 9999745024,
+  "train_loss": 3.1033270359039307,
+  "validation_loss": 3.0308315753936768,
+  "validation_perplexity": 20.71445105696278,
+  "hellaswag_results": {
+    "step": 19073,
+    "accuracy": 0.30033857797251545,
+    "accuracy_percent": 30.033857797251545,
+    "correct": 3016,
+    "total": 10042
+  },
+  "training_time_seconds": 33846.82095974899,
+  "training_time_hours": 9.401894711041386,
+  "throughput_tokens_per_second": 295441.188875369,
+  "mean_logged_throughput_tokens_per_second": 299864.48661379446,
+  "estimated_cost_usd": 25.385115719811744,
+  "estimated_cost_basis": {
+    "gpu": "1x H100",
+    "rate_usd_per_minute": 0.045,
+    "duration_seconds": 33846.82095974899,
+    "scope": "cumulative training wall time recorded in the final checkpoint"
+  },
+  "platform_reported_month_to_date_spend_usd": 0.0,
+  "checkpoint_sha256": "e519d993d20c98c841ef061f76a1dec3e6ee24d5e55162bdea2a3e2da280fd40",
+  "git_commit_sha": "36bfc9edd044eb828e118d49c79532eef8440a2a",
+  "execution_source_git_sha": "9862792ab4024f9ebec758be73ebe7e75419d09b",
+  "wandb_run_id": "65e78f54c14046ef99e04e12e7b3e810",
+  "wandb_run_url": "https://wandb.ai/ctxnn-thapar-university/gpt2-from-scratch/runs/65e78f54c14046ef99e04e12e7b3e810",
+  "wandb_state": "finished",
+  "wandb_last_history_step": 19073,
+  "final_checkpoint": "s3://gpt2-fineweb10b/training/gpt2-124m-fineweb10b-20260729t103500z-36bfc9e/checkpoints/final_step_019073.pt",
+  "completed_at": "2026-07-31T11:39:04.721023+00:00"
+}

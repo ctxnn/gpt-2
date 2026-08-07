@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">GPT-2 124M from scratch</title>
+  <desc id="desc">Social preview for the GPT-2 model card.</desc>
+  <rect width="1200" height="630" fill="#f2efe8"/>
+  <path d="M0 1h1200M0 629h1200" stroke="#171714"/>
+  <rect x="64" y="56" width="52" height="52" fill="#171714"/>
+  <text x="90" y="89" fill="#f2efe8" font-family="Helvetica,Arial,sans-serif" font-size="16" font-weight="700" text-anchor="middle">G2</text>
+  <text x="136" y="78" fill="#171714" font-family="Helvetica,Arial,sans-serif" font-size="13" font-weight="700" letter-spacing="2">MODEL RECORD / 001</text>
+  <text x="64" y="240" fill="#171714" font-family="Helvetica,Arial,sans-serif" font-size="102" font-weight="700" letter-spacing="-7">GPT-2 124M,</text>
+  <text x="64" y="340" fill="#c84e32" font-family="Georgia,serif" font-size="88" font-style="italic" letter-spacing="-4">rebuilt from first principles.</text>
+  <line x1="64" y1="432" x2="1136" y2="432" stroke="#171714"/>
+  <g font-family="Helvetica,Arial,sans-serif">
+    <text x="64" y="474" fill="#7d7c73" font-size="12" font-weight="700" letter-spacing="2">PARAMETERS</text>
+    <text x="64" y="530" fill="#171714" font-size="44" font-weight="700">124.48M</text>
+    <text x="328" y="474" fill="#7d7c73" font-size="12" font-weight="700" letter-spacing="2">TRAINING TOKENS</text>
+    <text x="328" y="530" fill="#171714" font-size="44" font-weight="700">10.00B</text>
+    <text x="592" y="474" fill="#7d7c73" font-size="12" font-weight="700" letter-spacing="2">VALIDATION LOSS</text>
+    <text x="592" y="530" fill="#171714" font-size="44" font-weight="700">3.0308</text>
+    <text x="856" y="474" fill="#7d7c73" font-size="12" font-weight="700" letter-spacing="2">HELLASWAG</text>
+    <text x="856" y="530" fill="#c84e32" font-size="44" font-weight="700">30.03%</text>
+    <text x="64" y="592" fill="#56564f" font-size="14">Architecture · training · evaluation · recovery · limitations</text>
+    <text x="1136" y="592" fill="#56564f" font-size="14" text-anchor="end">ctxnn / gpt-2</text>
+  </g>
+</svg>

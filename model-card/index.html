@@ -1,0 +1,676 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="An evidence-led model card for GPT-2 124M trained from scratch on 10 billion FineWeb-Edu tokens."
+    />
+    <meta name="theme-color" content="#f2efe8" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content="GPT-2 124M — a from-scratch training record" />
+    <meta
+      property="og:description"
+      content="Architecture, training, evaluation, recovery engineering, limitations, and reproducibility."
+    />
+    <meta property="og:url" content="https://ctxnn.github.io/gpt-2/" />
+    <meta property="og:image" content="https://ctxnn.github.io/gpt-2/social-card.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content="https://ctxnn.github.io/gpt-2/social-card.png" />
+    <title>GPT-2 124M — Model Card</title>
+    <link rel="icon" href="./mark.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script defer src="./data/evidence.js"></script>
+    <script defer src="./app.js"></script>
+  </head>
+  <body>
+    <div class="reading-progress" aria-hidden="true"><span></span></div>
+    <a class="skip-link" href="#main-content">Skip to model card</a>
+
+    <header class="site-header">
+      <a class="site-mark" href="#top" aria-label="GPT-2 model card home">
+        <span class="mark-glyph" aria-hidden="true">G2</span>
+        <span class="mark-label">Model record <i>/</i> 001</span>
+      </a>
+      <nav class="top-links" aria-label="Project links">
+        <a href="https://github.com/ctxnn/gpt-2">Source</a>
+        <a href="https://huggingface.co/ctxnn1/gpt2-124m-fineweb-edu-10b">Weights</a>
+        <a class="top-cta" href="https://huggingface.co/spaces/ctxnn1/gpt2-from-scratch-demo">
+          Try the model <span aria-hidden="true">↗</span>
+        </a>
+      </nav>
+    </header>
+
+    <main id="main-content">
+      <header class="hero" id="top">
+        <div class="hero-kicker">
+          <span>From-scratch pretraining</span>
+          <span>Completed 31 July 2026</span>
+        </div>
+        <h1>GPT-2 124M,<br /><em>rebuilt from first principles.</em></h1>
+        <p class="hero-deck">
+          A decoder-only Transformer trained from random initialization on nearly 10 billion
+          FineWeb-Edu tokens—documented from architecture and data preparation through failure
+          recovery, evaluation, and public release.
+        </p>
+
+        <dl class="hero-metrics" aria-label="Training summary">
+          <div>
+            <dt>Parameters</dt>
+            <dd data-metric="parameters">124.48M</dd>
+          </div>
+          <div>
+            <dt>Training tokens</dt>
+            <dd data-metric="tokens">10.00B</dd>
+          </div>
+          <div>
+            <dt>Validation loss</dt>
+            <dd data-metric="validation-loss">3.0308</dd>
+          </div>
+          <div>
+            <dt>HellaSwag</dt>
+            <dd data-metric="hellaswag">30.03%</dd>
+          </div>
+        </dl>
+
+        <div class="hero-footer">
+          <p><strong>Training:</strong> 1× NVIDIA H100 · 9.40 hours · 295k tokens/s</p>
+          <p><strong>Author:</strong> Chirag Taneja · <a href="https://github.com/ctxnn">@ctxnn</a></p>
+        </div>
+      </header>
+
+      <div class="article-layout">
+        <aside class="section-rail" aria-label="On this page">
+          <p>On this page</p>
+          <nav>
+            <a href="#overview" class="is-active"><span>01</span> Overview</a>
+            <a href="#architecture"><span>02</span> Architecture</a>
+            <a href="#data"><span>03</span> Data</a>
+            <a href="#training"><span>04</span> Training</a>
+            <a href="#results"><span>05</span> Results</a>
+            <a href="#reliability"><span>06</span> Reliability</a>
+            <a href="#samples"><span>07</span> Samples</a>
+            <a href="#responsible-use"><span>08</span> Use & limits</a>
+            <a href="#resources"><span>09</span> Resources</a>
+          </nav>
+        </aside>
+
+        <article class="model-card">
+          <section id="overview" class="article-section intro-section" data-section>
+            <p class="byline">Research and engineering record · Chirag Taneja</p>
+            <p class="lead">
+              What does it take to reproduce a foundational language model—not by fine-tuning an
+              existing checkpoint, but by constructing the network, preparing the corpus, and
+              carrying a random initialization through a complete pretraining run?
+            </p>
+            <p>
+              This project implements GPT-2 small as a compact, readable PyTorch system. It includes
+              causal multi-head self-attention, pre-normalized residual blocks, tied token and output
+              weights, distributed-aware data loading, bfloat16 training, deterministic evaluation,
+              and exact checkpoint resume. The final model processed
+              <strong data-metric="tokens-exact">9,999,745,024 tokens</strong> over
+              <strong data-metric="steps">19,073 optimizer steps</strong>.
+            </p>
+            <p>
+              The result is intentionally modest in scale and unusually complete in documentation.
+              The model, training record, public demo, metrics, checkpoint verification, recovery
+              chronology, and source code can all be inspected independently.
+            </p>
+
+            <aside class="notice notice-dark" aria-label="Important model classification">
+              <span class="notice-index">Important</span>
+              <div>
+                <h2>This is a base completion model—not a chatbot.</h2>
+                <p>
+                  It was not instruction-tuned, preference-aligned, or safety-tuned. It predicts
+                  plausible continuations and should not be expected to follow conversational
+                  instructions reliably.
+                </p>
+              </div>
+            </aside>
+
+            <figure class="wide-figure run-signature">
+              <figcaption>
+                <span>Run signature</span>
+                <span>Terminal checkpoint · independently verified</span>
+              </figcaption>
+              <div class="signature-grid">
+                <div><small>Compute</small><strong>1× H100</strong><span>single GPU</span></div>
+                <div><small>Duration</small><strong data-metric="hours">9.40 h</strong><span>cumulative training</span></div>
+                <div><small>Throughput</small><strong data-metric="throughput-short">295k</strong><span>tokens per second</span></div>
+                <div><small>Compute cost</small><strong data-metric="cost">$25.39</strong><span>time × rate estimate</span></div>
+                <div><small>Checkpoint</small><strong>1.39 GiB</strong><span>SHA-256 verified</span></div>
+                <div><small>Status</small><strong>Complete</strong><span>publicly released</span></div>
+              </div>
+            </figure>
+          </section>
+
+          <section id="architecture" class="article-section" data-section>
+            <header class="section-heading">
+              <p>02 · Architecture</p>
+              <h2>A small Transformer, shown all the way through.</h2>
+            </header>
+            <p>
+              GPT-2 is a decoder-only Transformer: every token can attend only to itself and earlier
+              tokens. The implementation uses learned token and position embeddings, twelve identical
+              pre-LN Transformer blocks, a final layer norm, and a vocabulary projection whose weights
+              are shared with the input embedding table.
+            </p>
+
+            <figure class="wide-figure architecture-figure" aria-labelledby="architecture-caption">
+              <figcaption id="architecture-caption">
+                <span>Model dataflow</span>
+                <span>Select a block to inspect it</span>
+              </figcaption>
+              <div class="architecture-flow">
+                <div class="flow-node flow-input">
+                  <small>Input</small>
+                  <strong>Token IDs</strong>
+                  <span>≤ 1,024 positions</span>
+                </div>
+                <span class="flow-arrow" aria-hidden="true">→</span>
+                <div class="flow-node flow-embedding">
+                  <small>Embedding</small>
+                  <strong>Token + position</strong>
+                  <span>50,304 × 768</span>
+                </div>
+                <span class="flow-arrow" aria-hidden="true">→</span>
+
+                <div class="transformer-stack" aria-label="Twelve Transformer blocks">
+                  <p>12× Transformer blocks</p>
+                  <div>
+                    <button type="button" data-layer="1" class="is-selected" aria-pressed="true">01</button>
+                    <button type="button" data-layer="2" aria-pressed="false">02</button>
+                    <button type="button" data-layer="3" aria-pressed="false">03</button>
+                    <button type="button" data-layer="4" aria-pressed="false">04</button>
+                    <button type="button" data-layer="5" aria-pressed="false">05</button>
+                    <button type="button" data-layer="6" aria-pressed="false">06</button>
+                    <button type="button" data-layer="7" aria-pressed="false">07</button>
+                    <button type="button" data-layer="8" aria-pressed="false">08</button>
+                    <button type="button" data-layer="9" aria-pressed="false">09</button>
+                    <button type="button" data-layer="10" aria-pressed="false">10</button>
+                    <button type="button" data-layer="11" aria-pressed="false">11</button>
+                    <button type="button" data-layer="12" aria-pressed="false">12</button>
+                  </div>
+                </div>
+
+                <span class="flow-arrow" aria-hidden="true">→</span>
+                <div class="flow-node flow-output">
+                  <small>Output</small>
+                  <strong>LN + tied head</strong>
+                  <span>next-token logits</span>
+                </div>
+              </div>
+
+              <div class="layer-inspector" aria-live="polite">
+                <div class="inspector-title">
+                  <span>Block <b data-active-layer>01</b></span>
+                  <small>Identical topology · independent weights</small>
+                </div>
+                <div class="block-path">
+                  <div><small>Normalize</small><strong>LayerNorm</strong><span>768 features</span></div>
+                  <span>→</span>
+                  <div class="accent-node"><small>Mix context</small><strong>Causal attention</strong><span>12 heads × 64</span></div>
+                  <span>+</span>
+                  <div><small>Normalize</small><strong>LayerNorm</strong><span>768 features</span></div>
+                  <span>→</span>
+                  <div><small>Transform</small><strong>GELU MLP</strong><span>768 → 3,072 → 768</span></div>
+                  <span>+</span>
+                </div>
+                <p>
+                  Both sublayers use pre-normalization and residual addition. Attention calls
+                  PyTorch’s scaled dot-product kernel with <code>is_causal=True</code>; the MLP
+                  expands the channel width by 4× before projecting back.
+                </p>
+              </div>
+            </figure>
+
+            <div class="spec-grid">
+              <div><span>Context</span><strong>1,024</strong><small>tokens</small></div>
+              <div><span>Width</span><strong>768</strong><small>embedding dimensions</small></div>
+              <div><span>Depth</span><strong>12</strong><small>Transformer blocks</small></div>
+              <div><span>Heads</span><strong>12</strong><small>64 dimensions each</small></div>
+              <div><span>MLP</span><strong>3,072</strong><small>hidden dimensions</small></div>
+              <div><span>Vocabulary</span><strong>50,304</strong><small>padded for efficiency</small></div>
+            </div>
+
+            <figure class="wide-figure parameter-figure">
+              <figcaption>
+                <span>Where 124,475,904 parameters live</span>
+                <span>The language-model head is weight-tied</span>
+              </figcaption>
+              <div class="parameter-bars" role="img" aria-label="Parameter count by component">
+                <div class="parameter-row">
+                  <div><strong>12 Transformer blocks</strong><span>85,054,464 · 68.33%</span></div>
+                  <div class="bar-track"><i style="--bar: 68.33%"></i></div>
+                </div>
+                <div class="parameter-row">
+                  <div><strong>Token embeddings</strong><span>38,633,472 · 31.04%</span></div>
+                  <div class="bar-track"><i style="--bar: 31.04%"></i></div>
+                </div>
+                <div class="parameter-row">
+                  <div><strong>Position embeddings</strong><span>786,432 · 0.63%</span></div>
+                  <div class="bar-track"><i style="--bar: 0.63%"></i></div>
+                </div>
+                <div class="parameter-row">
+                  <div><strong>Final LayerNorm</strong><span>1,536 · &lt;0.01%</span></div>
+                  <div class="bar-track"><i style="--bar: 0.001234%"></i></div>
+                </div>
+              </div>
+              <p class="figure-note">
+                Weight tying reuses the 38.6M-token embedding matrix for output logits, avoiding a
+                second vocabulary projection with the same shape.
+              </p>
+            </figure>
+          </section>
+
+          <section id="data" class="article-section" data-section>
+            <header class="section-heading">
+              <p>03 · Data</p>
+              <h2>Ten billion educational tokens, verified shard by shard.</h2>
+            </header>
+            <p>
+              Training used the <a href="https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu">FineWeb-Edu</a>
+              <code>sample-10BT</code> configuration. Documents were encoded with the GPT-2
+              <code>tiktoken</code> vocabulary, prefixed with the end-of-text token, stored as
+              compact <code>uint16</code> arrays, and divided into 100 verified shards.
+            </p>
+
+            <figure class="wide-figure pipeline-figure">
+              <figcaption>
+                <span>Dataset preparation</span>
+                <span>Network work remains separate from paid training</span>
+              </figcaption>
+              <ol class="pipeline">
+                <li><span>01</span><strong>FineWeb-Edu</strong><small>sample-10BT documents</small></li>
+                <li><span>02</span><strong>GPT-2 tokenizer</strong><small>EOT + ordinary tokens</small></li>
+                <li><span>03</span><strong>NumPy shards</strong><small>up to 100M uint16 tokens</small></li>
+                <li><span>04</span><strong>Verify & hash</strong><small>readability, size, SHA-256</small></li>
+                <li><span>05</span><strong>Manifest complete</strong><small>100 shards · ~19.9 GB</small></li>
+              </ol>
+            </figure>
+
+            <div class="two-column-copy">
+              <div>
+                <h3>Ordered loading</h3>
+                <p>
+                  Shard names are validated and numerically ordered before training. A malformed,
+                  duplicated, or missing shard causes a preflight failure rather than an expensive
+                  partial run.
+                </p>
+              </div>
+              <div>
+                <h3>Deterministic position</h3>
+                <p>
+                  <code>DataLoaderLite</code> records the rank-zero data position plus batch,
+                  sequence, and world-size metadata, allowing every distributed rank to reconstruct
+                  its exact position after resume.
+                </p>
+              </div>
+            </div>
+
+            <aside class="evidence-note">
+              <span>Data evidence</span>
+              <div>
+                <p>
+                  The finalized manifest records 9,953,989,344 unique prepared tokens across 100
+                  shards; the final shard is partial. Training processed 9,999,745,024 tokens,
+                  including a 45,755,680-token loader wrap—about 0.46% of the prepared corpus.
+                </p>
+                <p>
+                  FineWeb-Edu is filtered web data, not a curated truth set. The run did not perform a
+                  separate memorization, demographic-bias, or personally identifiable information
+                  audit of the training corpus.
+                </p>
+              </div>
+            </aside>
+          </section>
+
+          <section id="training" class="article-section" data-section>
+            <header class="section-heading">
+              <p>04 · Training</p>
+              <h2>A production recipe small enough to audit.</h2>
+            </header>
+            <p>
+              Each optimizer step aggregates 32 micro-batches of 16 sequences × 1,024 tokens,
+              producing an effective batch of 524,288 tokens. The run uses AdamW, bfloat16
+              autocasting, gradient clipping, linear warmup, and cosine learning-rate decay.
+            </p>
+
+            <div class="equation-strip" aria-label="Effective batch calculation">
+              <div><span>16</span><small>sequences</small></div>
+              <b>×</b>
+              <div><span>1,024</span><small>tokens each</small></div>
+              <b>×</b>
+              <div><span>32</span><small>accumulation steps</small></div>
+              <b>=</b>
+              <div class="equation-result"><span>524,288</span><small>tokens / optimizer step</small></div>
+            </div>
+
+            <dl class="recipe-table">
+              <div><dt>Maximum learning rate</dt><dd>6 × 10<sup>−4</sup></dd></div>
+              <div><dt>Minimum learning rate</dt><dd>6 × 10<sup>−5</sup></dd></div>
+              <div><dt>Warmup</dt><dd>715 steps</dd></div>
+              <div><dt>Weight decay</dt><dd>0.1</dd></div>
+              <div><dt>Gradient clipping</dt><dd>1.0</dd></div>
+              <div><dt>Precision</dt><dd>bfloat16</dd></div>
+              <div><dt>Initialization seed</dt><dd>42</dd></div>
+              <div><dt>Compilation</dt><dd>Disabled</dd></div>
+            </dl>
+
+            <aside class="evidence-note">
+              <span>Cost accounting</span>
+              <p>
+                The $25.39 figure is 33,846.821 seconds of checkpoint-recorded training time ×
+                $0.045 per H100-minute. The platform ledger reported $0.00, so this is a resource
+                estimate—not an invoice or corroborated billed spend.
+              </p>
+            </aside>
+
+            <figure class="wide-figure chart-figure">
+              <figcaption>
+                <span>Learning-rate schedule</span>
+                <span>Observed continuation · steps 13,140–19,070</span>
+              </figcaption>
+              <div id="learning-rate-chart" class="chart" data-chart="learning-rate" aria-label="Learning-rate chart"></div>
+              <p class="figure-note">The complete schedule is defined by the run configuration; the committed scalar history contains the final continuation segment.</p>
+            </figure>
+          </section>
+
+          <section id="results" class="article-section" data-section>
+            <header class="section-heading">
+              <p>05 · Results</p>
+              <h2>The terminal checkpoint improved cleanly to the end.</h2>
+            </header>
+            <p>
+              The final checkpoint records a training loss of <strong data-metric="train-loss">3.1033</strong>,
+              validation loss of <strong data-metric="validation-loss">3.0308</strong>, and validation
+              perplexity of <strong data-metric="perplexity">20.71</strong>. The graphs below are
+              generated directly from the committed CSV and clearly mark the observed continuation window.
+            </p>
+
+            <figure class="wide-figure chart-figure">
+              <figcaption>
+                <span>Optimization trajectory</span>
+                <span>Raw training loss + rolling mean</span>
+              </figcaption>
+              <div id="training-loss-chart" class="chart" data-chart="training-loss" aria-label="Training-loss chart"></div>
+            </figure>
+
+            <figure class="wide-figure chart-figure">
+              <figcaption>
+                <span>Validation loss</span>
+                <span>25 deterministic evaluations</span>
+              </figcaption>
+              <div id="validation-loss-chart" class="chart" data-chart="validation-loss" aria-label="Validation-loss chart"></div>
+            </figure>
+
+            <figure class="wide-figure chart-figure">
+              <figcaption>
+                <span>Training throughput</span>
+                <span>Final continuation · single H100</span>
+              </figcaption>
+              <div id="throughput-chart" class="chart" data-chart="throughput" aria-label="Training-throughput chart"></div>
+            </figure>
+
+            <figure class="wide-figure benchmark-figure">
+              <figcaption>
+                <span>Zero-shot HellaSwag accuracy</span>
+                <span>Normalized completion likelihood</span>
+              </figcaption>
+              <div class="benchmark-scale" aria-hidden="true"><span>0%</span><span>10</span><span>20</span><span>30</span><span>40%</span></div>
+              <div class="benchmark-bars" role="img" aria-label="HellaSwag accuracy: random baseline 25 percent, released OpenAI GPT-2 124M 29.4 percent, this run 30.0339 percent">
+                <div>
+                  <p><strong>Random choice</strong><span>25.0%</span></p>
+                  <i style="--score: 62.5%"></i>
+                </div>
+                <div>
+                  <p><strong>Released GPT-2 124M</strong><span>29.4%</span></p>
+                  <i style="--score: 73.5%"></i>
+                </div>
+                <div class="is-project">
+                  <p><strong>This FineWeb-Edu run</strong><span data-metric="hellaswag-long">30.0339%</span></p>
+                  <i style="--score: 75.08475%"></i>
+                </div>
+              </div>
+              <p class="figure-note">
+                3,016 / 10,042 correct. The 29.4% reference is Karpathy’s evaluation of the released
+                checkpoint, not a number from OpenAI’s original paper. The datasets differ and the
+                reference is rounded, so this is a descriptive—not controlled—comparison.
+              </p>
+            </figure>
+          </section>
+
+          <section id="reliability" class="article-section" data-section>
+            <header class="section-heading">
+              <p>06 · Reliability</p>
+              <h2>The run survived because state was treated as a product.</h2>
+            </header>
+            <p>
+              The most consequential engineering work was not another model layer. It was making a
+              multi-hour paid run recoverable: atomic local checkpoints, complete optimizer and RNG
+              state, verified uploads, bounded retries, resumable downloads, and a latest pointer that
+              advances only after integrity checks pass.
+            </p>
+
+            <figure class="wide-figure recovery-figure">
+              <figcaption>
+                <span>Failure and recovery chronology</span>
+                <span>One continuous optimization identity</span>
+              </figcaption>
+              <ol class="recovery-timeline">
+                <li>
+                  <span>01</span>
+                  <div><strong>Artifact channel overflow</strong><p>The tokenized dataset exceeded the 5 GiB batch artifact path.</p></div>
+                  <small>Moved to progressive, verified object-storage uploads.</small>
+                </li>
+                <li>
+                  <span>02</span>
+                  <div><strong>Preparation retries</strong><p>Runtime image, tokenizer resources, and workspace constraints surfaced.</p></div>
+                  <small>Restored the ordered original loader and retained completed shards.</small>
+                </li>
+                <li>
+                  <span>03</span>
+                  <div><strong>Checkpoint response loss</strong><p>A synchronizer lost a response while rereading a large object.</p></div>
+                  <small>Switched to local SHA-256 plus remote size and sidecar checks.</small>
+                </li>
+                <li>
+                  <span>04</span>
+                  <div><strong>Interrupted transfers</strong><p>Transient upload and download failures threatened continuation.</p></div>
+                  <small>Added bounded retries, range resume, and atomic finalization.</small>
+                </li>
+                <li>
+                  <span>05</span>
+                  <div><strong>Verified continuation</strong><p>Model, optimizer, loader, RNG, token count, and W&B identity restored.</p></div>
+                  <small>Resumed at completed step + 1 and finished step 19,073.</small>
+                </li>
+              </ol>
+            </figure>
+
+            <figure class="wide-figure checkpoint-figure">
+              <figcaption>
+                <span>Anatomy of the final checkpoint</span>
+                <span>1,493,919,114 bytes · CPU load passed</span>
+              </figcaption>
+              <div class="checkpoint-core">
+                <div class="checkpoint-center"><span>final_step_<br />019073.pt</span><small>format v1</small></div>
+                <ul>
+                  <li><strong>Model</strong><span>149 tensors · 124.48M parameters</span></li>
+                  <li><strong>Optimizer</strong><span>AdamW momentum and variance state</span></li>
+                  <li><strong>Data loader</strong><span>Shard, position, batch, and rank state</span></li>
+                  <li><strong>Randomness</strong><span>CPU, CUDA, Python, and NumPy RNG</span></li>
+                  <li><strong>Provenance</strong><span>Config, Git SHA, W&B ID, elapsed time</span></li>
+                  <li><strong>Integrity</strong><span>Size, SHA-256, sidecar, and latest pointer</span></li>
+                </ul>
+              </div>
+              <p class="hash-line"><span>SHA-256</span><code>e519d993d20c98c841ef061f76a1dec3e6ee24d5e55162bdea2a3e2da280fd40</code></p>
+            </figure>
+          </section>
+
+          <section id="samples" class="article-section" data-section>
+            <header class="section-heading">
+              <p>07 · Samples</p>
+              <h2>What the base model continues.</h2>
+            </header>
+            <p>
+              These fixed-seed samples use top-50 sampling and a 72-token total sequence limit. They
+              are qualitative examples, not benchmark scores. Their unevenness is representative of
+              a small, unaligned completion model.
+            </p>
+
+            <div class="sample-browser">
+              <div class="sample-tabs" role="tablist" aria-label="Generation prompts">
+                <button id="tab-ai" role="tab" aria-selected="true" aria-controls="panel-ai" data-sample="ai">Artificial intelligence</button>
+                <button id="tab-science" role="tab" aria-selected="false" aria-controls="panel-science" data-sample="science">Scientific discovery</button>
+                <button id="tab-story" role="tab" aria-selected="false" aria-controls="panel-story" data-sample="story">Story opening</button>
+                <button id="tab-problem" role="tab" aria-selected="false" aria-controls="panel-problem" data-sample="problem">Problem solving</button>
+              </div>
+              <div id="panel-ai" class="sample-panel" data-sample-panel="ai" role="tabpanel" aria-labelledby="tab-ai">
+                <p class="sample-prompt">The future of artificial intelligence is</p>
+                <blockquote>
+                  The future of artificial intelligence is also expanding. As artificial intelligence
+                  and its algorithms have increasingly grown, the field continues to rely heavily on
+                  human experts and computer vision researchers to guide its operations and its
+                  algorithms remain largely untrained…
+                </blockquote>
+              </div>
+              <div id="panel-science" class="sample-panel" data-sample-panel="science" role="tabpanel" aria-labelledby="tab-science" hidden>
+                <p class="sample-prompt">In a surprising scientific discovery,</p>
+                <blockquote>
+                  In a surprising scientific discovery, Professor O’Donovan describes how our eyes
+                  react to food and what the science means. “I just love that, since it reminds me I
+                  can.” “What’s next,” Sitting and listening to our voices…
+                </blockquote>
+              </div>
+              <div id="panel-story" class="sample-panel" data-sample-panel="story" role="tabpanel" aria-labelledby="tab-story" hidden>
+                <p class="sample-prompt">Once upon a time in a small village,</p>
+                <blockquote>
+                  Once upon a time in a small village, two Indians (Atharaswadasa, Aayogyaas, Surya,
+                  etc.) tried to make their neighbors disappear forever, even after only a few months…
+                </blockquote>
+              </div>
+              <div id="panel-problem" class="sample-panel" data-sample-panel="problem" role="tabpanel" aria-labelledby="tab-problem" hidden>
+                <p class="sample-prompt">To solve a difficult problem, first</p>
+                <blockquote>
+                  To solve a difficult problem, first evaluate the problem. A good method to help the
+                  system identify, solve, and resolve any problem is to first define “problems” using
+                  a given number concept…
+                </blockquote>
+              </div>
+              <footer><span>Seed 19073</span><span>Top-k 50</span><span>GPT-2 tiktoken</span></footer>
+            </div>
+          </section>
+
+          <section id="responsible-use" class="article-section" data-section>
+            <header class="section-heading">
+              <p>08 · Intended use and limitations</p>
+              <h2>Useful as a learning artifact. Limited as a language system.</h2>
+            </header>
+
+            <div class="use-grid">
+              <article>
+                <span>Appropriate use</span>
+                <h3>Research and education</h3>
+                <ul>
+                  <li>Studying a readable GPT-2 implementation.</li>
+                  <li>Reproducing training and checkpoint mechanics.</li>
+                  <li>Exploring base-model text continuation.</li>
+                  <li>Benchmarking small-model infrastructure.</li>
+                </ul>
+              </article>
+              <article class="use-negative">
+                <span>Out of scope</span>
+                <h3>Autonomous or high-stakes use</h3>
+                <ul>
+                  <li>Conversational instruction following.</li>
+                  <li>Medical, legal, financial, or safety decisions.</li>
+                  <li>Unsafeguarded public content generation.</li>
+                  <li>Claims requiring factual reliability.</li>
+                </ul>
+              </article>
+            </div>
+
+            <div class="limitation-list">
+              <article><span>01</span><div><h3>Scale</h3><p>124M parameters and one approximately 10B-token pass are not competitive with modern frontier systems.</p></div></article>
+              <article><span>02</span><div><h3>Alignment</h3><p>No instruction tuning, preference optimization, refusal training, or dedicated safety tuning was performed.</p></div></article>
+              <article><span>03</span><div><h3>Content risks</h3><p>Outputs may be incorrect, incoherent, biased, unsafe, or stylistically derivative of pretraining data.</p></div></article>
+              <article><span>04</span><div><h3>Evaluation coverage</h3><p>HellaSwag is the only full downstream benchmark; no broad safety, bias, memorization, or toxicity suite was run.</p></div></article>
+              <article><span>05</span><div><h3>Evidence window</h3><p>The committed scalar history covers the final continuation segment, while terminal metrics come from the verified final checkpoint.</p></div></article>
+            </div>
+          </section>
+
+          <section id="resources" class="article-section resources-section" data-section>
+            <header class="section-heading">
+              <p>09 · Reproducibility and resources</p>
+              <h2>Follow every important claim back to evidence.</h2>
+            </header>
+            <p>
+              The public release separates narrative from evidence. Human-readable reports explain
+              the run; JSON, CSV, configuration, source, and checkpoint records make its central
+              claims inspectable.
+            </p>
+
+            <div class="resource-groups">
+              <section>
+                <h3>Use the model</h3>
+                <a href="https://huggingface.co/ctxnn1/gpt2-124m-fineweb-edu-10b"><span>Hugging Face model</span><small>Weights, tokenizer, configuration ↗</small></a>
+                <a href="https://huggingface.co/spaces/ctxnn1/gpt2-from-scratch-demo"><span>Live demo</span><small>CPU text-completion interface ↗</small></a>
+                <a href="https://wandb.ai/ctxnn-thapar-university/gpt2-from-scratch/runs/65e78f54c14046ef99e04e12e7b3e810"><span>Weights & Biases run</span><small>Finished history at step 19,073 ↗</small></a>
+              </section>
+              <section>
+                <h3>Inspect the evidence</h3>
+                <a href="./data/final_metrics.json"><span>Final metrics</span><small>Machine-readable terminal record ↗</small></a>
+                <a href="./data/final_checkpoint.json"><span>Checkpoint verification</span><small>Size, hash, state, and load checks ↗</small></a>
+                <a href="./data/training_history.csv"><span>Training history</span><small>Committed scalar continuation ↗</small></a>
+                <a href="./data/generated_samples.md"><span>Generated samples</span><small>Prompts and reproduction settings ↗</small></a>
+              </section>
+              <section>
+                <h3>Read the implementation</h3>
+                <a href="https://github.com/ctxnn/gpt-2/blob/main/train_gpt2.py#L47-L173"><span>Model architecture</span><small>Attention, MLP, blocks, GPT forward ↗</small></a>
+                <a href="https://github.com/ctxnn/gpt-2/blob/main/train_gpt2.py#L240-L362"><span>Data loader</span><small>Deterministic DDP-aware shard traversal ↗</small></a>
+                <a href="https://github.com/ctxnn/gpt-2/blob/main/train_gpt2.py#L554-L647"><span>Checkpoint state</span><small>Payload creation and exact restore ↗</small></a>
+                <a href="https://github.com/ctxnn/gpt-2/blob/main/fineweb.py#L116-L188"><span>Dataset preparation</span><small>Tokenization and shard creation ↗</small></a>
+              </section>
+              <section>
+                <h3>Methods and context</h3>
+                <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf"><span>Original GPT-2 report</span><small>Architecture and WebText framing ↗</small></a>
+                <a href="https://github.com/rowanz/hellaswag"><span>HellaSwag</span><small>Dataset and evaluation source ↗</small></a>
+                <a href="https://github.com/karpathy/llm.c/discussions/481"><span>GPT-2 reproduction baseline</span><small>29.4% comparison source ↗</small></a>
+              </section>
+            </div>
+
+            <div class="reproduce-block">
+              <div>
+                <span>Local smoke test</span>
+                <button class="copy-button" type="button" data-copy="python train_gpt2.py --smoke-test --benchmark-steps 1">Copy</button>
+              </div>
+              <pre><code>python train_gpt2.py --smoke-test --benchmark-steps 1</code></pre>
+            </div>
+          </section>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer">
+      <div>
+        <span class="mark-glyph" aria-hidden="true">G2</span>
+        <p>GPT-2 124M from scratch<br />FineWeb-Edu · 10B tokens</p>
+      </div>
+      <p>
+        Built as a transparent record of what worked,<br />what failed, and what the model cannot do.
+      </p>
+      <nav aria-label="Footer links">
+        <a href="https://github.com/ctxnn/gpt-2">GitHub ↗</a>
+        <a href="https://huggingface.co/ctxnn1/gpt2-124m-fineweb-edu-10b">Model ↗</a>
+        <a href="#top">Back to top ↑</a>
+      </nav>
+    </footer>
+
+    <noscript>
+      <div class="noscript-note">The article remains readable without JavaScript; interactive charts require it.</div>
+    </noscript>
+  </body>
+</html>

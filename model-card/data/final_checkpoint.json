@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "training_run_id": "gpt2-124m-fineweb10b-20260729t103500z-36bfc9e",
+  "filename": "final_step_019073.pt",
+  "s3_bucket": "gpt2-fineweb10b",
+  "s3_key": "training/gpt2-124m-fineweb10b-20260729t103500z-36bfc9e/checkpoints/final_step_019073.pt",
+  "s3_uri": "s3://gpt2-fineweb10b/training/gpt2-124m-fineweb10b-20260729t103500z-36bfc9e/checkpoints/final_step_019073.pt",
+  "size_bytes": 1493919114,
+  "sha256": "e519d993d20c98c841ef061f76a1dec3e6ee24d5e55162bdea2a3e2da280fd40",
+  "completed_step": 19073,
+  "next_step": 19074,
+  "tokens_processed": 9999745024,
+  "checkpoint_format_version": 1,
+  "model_parameter_count": 124475904,
+  "model_tensor_count": 149,
+  "contains_optimizer_state": true,
+  "contains_data_loader_state": true,
+  "contains_rng_state": true,
+  "torch_load": {
+    "status": "passed",
+    "map_location": "cpu",
+    "torch_version": "2.13.0"
+  },
+  "verification": {
+    "remote_object_exists": true,
+    "remote_size_matches": true,
+    "sidecar_sha256_matches": true,
+    "latest_pointer_matches": true,
+    "downloaded_size_matches": true,
+    "downloaded_sha256_matches": true,
+    "checkpoint_step_matches": true
+  },
+  "verified_at": "2026-07-31T11:38:56.994666+00:00",
+  "checkpoint_git_commit_sha": "36bfc9edd044eb828e118d49c79532eef8440a2a",
+  "execution_source_git_sha": "9862792ab4024f9ebec758be73ebe7e75419d09b",
+  "wandb_run_id": "65e78f54c14046ef99e04e12e7b3e810"
+}
