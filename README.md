@@ -1,6 +1,6 @@
 # GPT-2 124M from scratch on FineWeb-Edu
 
-**Interactive research model card:** [Architecture, training, evaluation, and limitations](https://ctxnn.github.io/gpt-2/model-card/)
+**Interactive research model card:** [Architecture, training, evaluation, and limitations](https://ctxnn.github.io/gpt-2/)
 
 This repository implements and pretrains the GPT-2 small architecture from random initialization. The completed production run processed **9,999,745,024 tokens** from FineWeb-Edu `sample-10BT` on a single NVIDIA H100 and reached optimizer step **19,073**.
 
